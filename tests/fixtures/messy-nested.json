@@ -1,0 +1,4 @@
+[
+  { "name": " Ada Lovelace ", "contact": { "email": "ada@example.com", "city": "London" }, "visits": 3 },
+  { "name": "Grace", "contact": { "email": "invalid-address", "city": "Paris" }, "visits": "N/A" }
+]

@@ -1,0 +1,5 @@
+[
+  { "name": " Ada Lovelace ", "age": 36, "email": "ada@example.com" },
+  { "name": "Grace", "age": null, "email": "grace@example.com" },
+  { "name": "Alan Turing", "age": 41, "email": null }
+]

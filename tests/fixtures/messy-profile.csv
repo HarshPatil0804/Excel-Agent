@@ -1,0 +1,8 @@
+name,email,phone,joined_on,amount,city
+ Ada Lovelace ,ada@example.com,+1-555-123-4567,2024-01-03,10,Paris
+Grace,grace-at-example.com,not-a-number,01/03/2024,12,PARIS
+Grace,grace-at-example.com,not-a-number,01/03/2024,12,PARIS
+Alan Turing,alan@example.com,5551234,2023-11-30,11,London
+N/A,-,,not-a-date,100,London
+Marie Curie,marie@example.com,555-0188,2024-03-02,11 ,paris
+Ragged row,ragged@example.com
