@@ -57,6 +57,17 @@ describe('CSV and JSON parsing', () => {
     expect(parsed.rows).toHaveLength(3)
   })
 
+  it('preserves true numeric cells and records coordinates of Excel date cells', () => {
+    const workbook = XLSX.utils.book_new()
+    const sheet = XLSX.utils.aoa_to_sheet([['Order_Date', 'Revenue'], [null, 50000]])
+    sheet.A2 = { t: 'd', v: new Date('2026-03-04T00:00:00.000Z'), z: 'dd/mm/yyyy' }
+    XLSX.utils.book_append_sheet(workbook, sheet, 'Raw_Data')
+    const parsed = parseWorksheet(sheet, 1)
+    expect(parsed.rows[0]?.Order_Date).toBe('2026-03-04T00:00:00.000Z')
+    expect(parsed.rows[0]?.Revenue).toBe(50000)
+    expect(parsed.excelDateRows).toEqual({ Order_Date: [0], Revenue: [] })
+  })
+
   it('flattens one level of nested objects and marks missing tokens', () => {
     const parsed = parseJsonText(nestedJson)
     expect(parsed.columns).toContain('contact.email')

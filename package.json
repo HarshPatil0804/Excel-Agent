@@ -9,7 +9,7 @@
     "lint": "eslint .",
     "typecheck": "tsc -b --pretty",
     "test": "vitest run --exclude src/engine/scale.test.ts",
-    "test:scale": "vitest run src/engine/scale.test.ts",
+    "test:scale": "node scripts/run-scale-tests.mjs",
     "preview": "vite preview",
     "format": "prettier --write ."
   },

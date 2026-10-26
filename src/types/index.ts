@@ -33,6 +33,7 @@ export interface ColumnProfile {
   invalidPhoneCount: number
   invalidDateCount: number
   iqrOutlierCount: number
+  currencySymbols: string[]
   issues: ColumnIssue[]
 }
 
@@ -55,6 +56,10 @@ export interface Dataset {
   columnCount: number
   createdAt: string
   largeFileMode: boolean
+  /** Internal row-key property used to align original and cleaned in-memory rows. */
+  rowOrderKey?: string
+  /** Row positions of cells imported as true Excel dates, before cleaning. */
+  excelDateRows?: Record<string, number[]>
   note?: string
 }
 
@@ -67,18 +72,18 @@ export interface CleaningRule {
   options: Record<string, string | number | boolean>
 }
 
-export type CleaningRuleKind = 'trim-whitespace' | 'normalize-missing' | 'formatted-numbers' | 'normalize-column-names' | 'remove-empty-rows' | 'remove-empty-columns' | 'fix-type-mismatches' | 'remove-duplicates' | 'fill-missing' | 'handle-outliers' | 'standardize-categories' | 'merge-categories' | 'resolve-ambiguous-dates'
+export type CleaningRuleKind = 'trim-whitespace' | 'normalize-missing' | 'formatted-numbers' | 'repair-mojibake' | 'canonicalize-categories' | 'normalize-dates' | 'normalize-column-names' | 'remove-empty-rows' | 'remove-empty-columns' | 'fix-type-mismatches' | 'remove-duplicates' | 'fill-missing' | 'handle-outliers' | 'resolve-validation' | 'standardize-categories' | 'merge-categories' | 'resolve-ambiguous-dates' | 'swap-excel-date-components'
 export type RuleScopeMode = 'all' | 'byType' | 'byIssue' | 'byNamePattern' | 'explicit'
 export interface RuleScope { mode: RuleScopeMode; types?: InferredType[]; issues?: string[]; pattern?: string; include?: string[]; exclude?: string[]; includeIds?: string[]; excludeIds?: string[] }
-export interface CleaningGroup { ruleId: string; category: string; label: string; columnCount: number; columns: string[]; columnIds?: string[]; affectedRows: number; samples: string[]; rowsRemoved?: number; cellsChanged?: number; cellsFlagged?: number; columnsRemoved?: number; columnsRenamed?: number; warning?: string }
-export interface PlannedRule { rule: CleaningRule; columns: string[]; columnIds: string[]; deferredColumns?: string[]; proposed: boolean; status?: 'pending'; reason: string }
+export interface CleaningGroup { ruleId: string; category: string; label: string; columnCount: number; columns: string[]; columnIds?: string[]; affectedRows: number; samples: string[]; rowsRemoved?: number; removedRowIds?: number[]; cellsChanged?: number; cellsEstimated?: number; cellsFlagged?: number; columnsRemoved?: number; columnsRenamed?: number; warning?: string }
+export interface PlannedRule { rule: CleaningRule; columns: string[]; columnIds: string[]; deferredColumns?: string[]; excludedColumns?: string[]; proposed: boolean; status?: 'pending'; reason: string }
 export interface SmartCleanResult { rows: DataRow[]; groups: CleaningGroup[]; proposed: PlannedRule[]; protectedColumns: string[]; changeLog: ChangeLogEntry[]; stableColumnIds?: Record<string, string>; warnings?: string[] }
 export interface CleaningRecipe { id: string; version: 1; name: string; createdAt: string; rules: CleaningRule[]; protectedColumns: string[]; columnTypes: Record<string, InferredType>; stableColumnIds?: Record<string, string>; protectedColumnIds?: string[] }
 export interface RecipeMatchReport { rules: CleaningRule[]; matched: Record<string, string[]>; protectedColumns: string[]; unmatched: string[]; ambiguous: string[] }
-export type RiskyDecisionKind = 'remove-duplicates' | 'fill-missing' | 'handle-outliers' | 'standardize-categories' | 'resolve-ambiguous-dates'
+export type RiskyDecisionKind = 'remove-duplicates' | 'fill-missing' | 'handle-outliers' | 'resolve-validation' | 'standardize-categories' | 'resolve-ambiguous-dates' | 'swap-excel-date-components'
 export interface RiskyDecision { kind: RiskyDecisionKind; options: Record<string, string | number | boolean | string[]>; columns: string[]; columnIds?: string[] }
-export interface RiskyDryRun { decision: RiskyDecision; rowsBefore: number; rowsAfter: number; rowsRemoved: number; cellsChanged: number; flaggedCells: number; samples: Array<{ before: DataRow; after: DataRow }> }
-export interface ChangeStep { id: string; label: string; ruleId: string; scope: RuleScope; timestamp: string; rowsBefore: number; rowsAfter: number; rowsRemoved: number; cellsChanged: number; columnsRenamed: number; flaggedCells: number; samples: Array<{ before: DataRow; after: DataRow }>; undone: boolean }
+export interface RiskyDryRun { decision: RiskyDecision; rowsBefore: number; rowsAfter: number; rowsRemoved: number; removedRowIds?: number[]; cellsChanged: number; cellsEstimated?: number; flaggedCells: number; samples: Array<{ before: DataRow; after: DataRow }> }
+export interface ChangeStep { id: string; label: string; ruleId: string; scope: RuleScope; timestamp: string; rowsBefore: number; rowsAfter: number; rowsRemoved: number; removedRowIds?: number[]; cellsChanged: number; cellsEstimated?: number; estimateDetailsByColumn?: Record<string, string>; estimateUncertaintyByColumn?: Record<string, Record<string, { value: number; kind: 'numeric' | 'categorical' }>>; columnsRenamed: number; flaggedCells: number; samples: Array<{ before: DataRow; after: DataRow }>; undone: boolean }
 
 export interface ChangeLogEntry {
   id: string
@@ -86,7 +91,9 @@ export interface ChangeLogEntry {
   description: string
   affectedRows: number
   rowsRemoved?: number
+  removedRowIds?: number[]
   cellsChanged?: number
+  cellsEstimated?: number
   columnsRenamed?: number
   cellsFlagged?: number
   timestamp: string

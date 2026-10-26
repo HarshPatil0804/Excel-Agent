@@ -14,7 +14,7 @@ describe('DuckDB risky SQL plans', () => {
   })
 
   it.each(['drop-rows', 'mean', 'median', 'mode', 'constant', 'forward-fill'])('builds missing-value SQL for %s', (strategy) => {
-    const sql = build('fill-missing', { strategy, value: '空' })
+    const sql = build('fill-missing', { strategy, value: '空', ...(strategy === 'forward-fill' ? { orderedRows: true } : {}) })
     expect(sql).toContain('"a"')
     expect(sql).toContain('__dc_order')
     if (strategy === 'drop-rows') expect(sql).toContain("'n/a'")
@@ -23,6 +23,17 @@ describe('DuckDB risky SQL plans', () => {
     if (strategy === 'mode') expect(sql).toContain('ORDER BY COUNT(*) DESC')
     if (strategy === 'constant') expect(sql).toContain("'空'")
     if (strategy === 'forward-fill') expect(sql).toContain('IGNORE NULLS')
+  })
+
+  it('blocks forward fill SQL unless row ordering is explicitly confirmed', () => {
+    expect(() => build('fill-missing', { strategy: 'forward-fill' })).toThrow(/ordered by time/i)
+  })
+
+  it.each(['group-median', 'group-mode'])('builds correlated SQL for %s', (strategy) => {
+    const sql = build('fill-missing', { strategy, groupBy: '名前' }, ['a'])
+    expect(sql).toContain('IS NOT DISTINCT FROM source_version."名前"')
+    expect(sql).toContain('group_source')
+    expect(sql).toContain(strategy === 'group-median' ? 'MEDIAN(TRY_CAST' : 'ORDER BY COUNT(*) DESC')
   })
 
   it.each(['flag', 'cap', 'remove'])('builds outlier SQL for %s', (action) => {

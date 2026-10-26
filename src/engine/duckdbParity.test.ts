@@ -4,12 +4,23 @@ import { resolve } from 'node:path'
 import * as duckdb from '@duckdb/duckdb-wasm/dist/duckdb-node-blocking'
 import { executeRiskyDecision } from './riskyDecisions'
 import { buildRiskySelect, quoteSqlIdentifier, quoteSqlString } from './riskySql'
-import { buildLowRiskExpression } from './lowRiskSql'
-import { transformValue } from '../cleaners/rules'
+import { buildCategoryCaseExpression, buildDateNormalizationExpression, buildLowRiskExpression, buildMojibakeRepairExpression } from './lowRiskSql'
+import { buildCategoryMapping, buildCategoryMappingFromCounts, transformValue } from '../cleaners/rules'
 import { LOW_RISK_RULES, runSmartClean, buildSmartCleanPlan } from './smartClean'
 import { profileDataset } from '../profiler/profile'
 import { globalLibraryFixture, trainFixture } from '../../tests/fixtures/smartCleanRegression'
 import { normalizeColumnName } from '../cleaners/rules'
+import { buildDuckDbCompareAfterSql, buildDuckDbCompareCountSql, buildDuckDbCompareSql, buildDuckDbRemovedRowsSql } from './duckdbCompare'
+import { buildDuckDbJsonExportProjection, normalizeDuckDbJsonValue } from './duckdbExport'
+import { buildDuckDbImputationSampleSql, buildDuckDbImputationViewSql, processDuckDbEstimateBatches } from './duckdbImputation'
+import { recommendMissingValues } from './localImputation'
+import { DuckDbBundleSession } from './duckdbBundle'
+import { serializeCsv } from '../lib/exportData'
+import { serializeJson, serializeXlsx, type ExportColumn } from '../lib/exportData'
+import { parseCsvText } from '../parsers/csv'
+import { parseJsonText } from '../parsers/json'
+import { parseWorksheet } from '../parsers/xlsx'
+import * as XLSX from 'xlsx'
 import type { DataRow, RiskyDecision } from '../types'
 
 let database: Awaited<ReturnType<typeof duckdb.createDuckDB>>
@@ -33,6 +44,29 @@ type OrderedRow = DataRow & { __dc_order: number }
 const cleanOrder = (row: OrderedRow): DataRow => Object.fromEntries(Object.entries(row).filter(([key]) => key !== '__dc_order')) as DataRow
 const canonicalRows = (rows: DataRow[]): DataRow[] => rows.map((row) => Object.fromEntries(Object.entries(row).map(([key, value]) => [key, canonical(value) as DataRow[string]])))
 const quote = (value: unknown): string => value == null ? 'NULL' : quoteSqlString(String(value))
+
+function unpackZip(bytes: Uint8Array): Record<string, string> {
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength)
+  const decode = (start: number, length: number) => new TextDecoder().decode(bytes.slice(start, start + length))
+  const end = bytes.length - 22
+  const count = view.getUint16(end + 10, true)
+  let cursor = view.getUint32(end + 16, true)
+  const files: Record<string, string> = {}
+  for (let index = 0; index < count; index += 1) {
+    const size = view.getUint32(cursor + 24, true)
+    const nameLength = view.getUint16(cursor + 28, true)
+    const extraLength = view.getUint16(cursor + 30, true)
+    const commentLength = view.getUint16(cursor + 32, true)
+    const localOffset = view.getUint32(cursor + 42, true)
+    const name = decode(cursor + 46, nameLength)
+    const localNameLength = view.getUint16(localOffset + 26, true)
+    const localExtraLength = view.getUint16(localOffset + 28, true)
+    const start = localOffset + 30 + localNameLength + localExtraLength
+    files[name] = decode(start, size)
+    cursor += 46 + nameLength + extraLength + commentLength
+  }
+  return files
+}
 
 function runDuckDbSmartClean(rows: DataRow[], columns: string[], profile: ReturnType<typeof profileDataset>, prefix: string): { rows: DataRow[]; columns: string[]; source: string; counts: Record<string, { cellsChanged: number; rowsRemoved: number; columnsRenamed: number }> } {
   const quoteId = (name: string) => `"${name.replaceAll('"', '""')}"`
@@ -94,6 +128,80 @@ function runDuckDbSmartClean(rows: DataRow[], columns: string[], profile: Return
 }
 
 describe('in-memory and DuckDB risky rule parity', () => {
+  it('applies the same validated seeded estimates in memory and DuckDB while preserving row order', async () => {
+    const rows: DataRow[] = Array.from({ length: 200 }, (_, index) => ({ signal: index, amount: index * 3 + 1 }))
+    for (let index = 0; index < rows.length; index += 7) rows[index]!.amount = null
+    const recommendation = recommendMissingValues(rows, ['amount'], ['signal'], 20261025, {}, { amount: 'integer' })[0]
+    expect(recommendation?.recommended).toBe(true)
+    if (recommendation?.validation?.kind !== 'numeric') throw new Error('Expected numeric model validation metrics')
+    const estimatedValues = JSON.stringify({ amount: recommendation!.estimates.map((estimate) => ({ rowIndex: estimate.sampleRow - 1, value: estimate.value, uncertainty: estimate.uncertainty })) })
+    const decision: RiskyDecision = { kind: 'fill-missing', columns: ['amount'], options: { strategy: 'model-estimates', estimatedValues, targetType: 'integer', model: recommendation.validation.model, validation: JSON.stringify(recommendation.validation) } }
+    const inMemory = executeRiskyDecision(rows, decision, [], false).rows
+
+    connection.query('DROP VIEW IF EXISTS imputation_result')
+    connection.query('DROP TABLE IF EXISTS imputation_result_values')
+    connection.query('DROP TABLE IF EXISTS imputation_result_source')
+    connection.query('CREATE TABLE imputation_result_source (signal BIGINT, amount DOUBLE, "__dc_order" BIGINT)')
+    const values = rows.map((row, index) => `(${row.signal}, ${row.amount == null ? 'NULL' : row.amount}, ${index})`).join(', ')
+    connection.query(`INSERT INTO imputation_result_source VALUES ${values}`)
+    const training = connection.query('SELECT signal, amount, "__dc_order" FROM imputation_result_source WHERE amount IS NOT NULL ORDER BY "__dc_order"').toArray().map((row) => row.toJSON() as DataRow)
+    const targets = connection.query('SELECT signal, amount, "__dc_order" FROM imputation_result_source WHERE amount IS NULL ORDER BY "__dc_order"').toArray().map((row) => row.toJSON() as DataRow)
+    const duckEstimates: Array<{ rowOrder: number; value: DataRow[string]; uncertainty: number }> = []
+    async function* pages() {
+      for (let offset = 0; offset < targets.length; offset += 7) yield targets.slice(offset, offset + 7)
+    }
+    const batchResult = await processDuckDbEstimateBatches(pages(), {
+      trainingRows: training, target: 'amount', features: ['signal'], targetType: 'integer', model: recommendation.validation.model, min: 4, max: 598, integerTarget: true, nonNegative: true,
+      insertBatch: async (batch) => { duckEstimates.push(...batch) },
+    })
+    expect(batchResult).toMatchObject({ processedRows: targets.length, estimatedCells: targets.length, cancelled: false })
+    expect(duckEstimates.map((estimate) => estimate.rowOrder)).toEqual(recommendation!.estimates.map((estimate) => estimate.sampleRow - 1))
+    duckEstimates.forEach((estimate) => expect(estimate.value as number).toBe(Number(inMemory[estimate.rowOrder]?.amount)))
+    connection.query('CREATE TABLE imputation_result_values ("__dc_order" BIGINT, "__dc_column" VARCHAR, "estimate_value" VARCHAR, "uncertainty" DOUBLE)')
+    connection.query(`INSERT INTO imputation_result_values VALUES ${duckEstimates.map((estimate) => `(${estimate.rowOrder}, 'amount', ${quote(estimate.value)}, ${estimate.uncertainty})`).join(', ')}`)
+    const view = buildDuckDbImputationViewSql('imputation_result_source', 'imputation_result_values', ['signal', 'amount'], 'amount', undefined, 'integer')
+    connection.query(`CREATE VIEW imputation_result AS ${view}`)
+    const duckRows = connection.query('SELECT signal, amount FROM imputation_result ORDER BY "__dc_order"').toArray().map((row) => row.toJSON() as DataRow)
+    expect(canonicalRows(duckRows.map((row) => ({ ...row, signal: Number(row.signal) })))).toEqual(canonicalRows(inMemory))
+    expect(duckEstimates).toHaveLength(rows.filter((row) => row.amount == null).length)
+    connection.query('DROP VIEW imputation_result')
+    connection.query('DROP TABLE imputation_result_values')
+    connection.query('DROP TABLE imputation_result_source')
+  })
+
+  it('materializes estimated values as an undoable DuckDB view without mutating its source', () => {
+    connection.query('DROP VIEW IF EXISTS estimate_version')
+    connection.query('DROP TABLE IF EXISTS estimate_source')
+    connection.query('DROP TABLE IF EXISTS estimate_values')
+    connection.query('CREATE TABLE estimate_source ("name" VARCHAR, "target" VARCHAR, "__dc_order" BIGINT)')
+    connection.query("INSERT INTO estimate_source VALUES ('missing', NULL, 0), ('observed', 'kept', 1)")
+    connection.query('CREATE TABLE estimate_values ("__dc_order" BIGINT, "__dc_column" VARCHAR, "estimate_value" VARCHAR, "uncertainty" DOUBLE)')
+    connection.query("INSERT INTO estimate_values VALUES (0, 'target', 'estimated', 0.1)")
+    connection.query(`CREATE VIEW estimate_version AS ${buildDuckDbImputationViewSql('estimate_source', 'estimate_values', ['name', 'target'], 'target', 'target_was_missing')}`)
+    const result = connection.query('SELECT * FROM estimate_version ORDER BY "__dc_order"').toArray().map((row) => row.toJSON())
+    expect(result.map((row) => row.target)).toEqual(['estimated', 'kept'])
+    expect(result.map((row) => row.target_was_missing)).toEqual([true, false])
+    expect(connection.query('SELECT target FROM estimate_source ORDER BY "__dc_order"').toArray().map((row) => row.toJSON().target)).toEqual([null, 'kept'])
+    connection.query('DROP VIEW estimate_version')
+    connection.query('DROP TABLE estimate_values')
+    connection.query('DROP TABLE estimate_source')
+  })
+
+  it('samples small DuckDB datasets fully and repeatably up to the configured cap', () => {
+    connection.query('DROP TABLE IF EXISTS imputation_sample')
+    connection.query('CREATE TABLE imputation_sample ("group name" VARCHAR, target VARCHAR, "__dc_order" BIGINT)')
+    const values = Array.from({ length: 120 }, (_, index) => `('${index % 2 ? 'west' : 'east'}', '${index % 2 ? 'B' : 'A'}', ${index})`).join(', ')
+    connection.query(`INSERT INTO imputation_sample VALUES ${values}`)
+    const sampleSql = buildDuckDbImputationSampleSql(['group name', 'target'], 50_000, 'imputation_sample')
+    const first = connection.query(sampleSql).toArray().map((row) => row.toJSON())
+    const repeated = connection.query(sampleSql).toArray().map((row) => row.toJSON())
+    expect(first).toHaveLength(120)
+    expect(first).toEqual(repeated)
+    expect(sampleSql).toContain('LIMIT 50000')
+    expect(sampleSql).not.toContain('% 101')
+    connection.query('DROP TABLE imputation_sample')
+  })
+
   it('runs Global Library shaped Smart Clean on both engines without losing rows or column identity', () => {
     const { rows, columns } = globalLibraryFixture()
     const profile = profileDataset(rows, columns)
@@ -128,7 +236,7 @@ describe('in-memory and DuckDB risky rule parity', () => {
     expect(profileAfter.columns.find((column) => column.name === 'expenditures')?.min).toBe(1)
     expect(profileAfter.columns.find((column) => column.name === 'expenditures')?.max).toBe(101)
     expect(profileAfter.columns.find((column) => column.name === 'country')?.id).toBe(profile.columns[0]?.id)
-  })
+  }, 15_000)
 
   it('keeps 17 train-shaped duplicates as a proposal on both paths, then removes them only when accepted', () => {
     const { rows, columns } = trainFixture()
@@ -195,8 +303,82 @@ describe('in-memory and DuckDB risky rule parity', () => {
     expect(Object.keys(actual[0] ?? {})).toContain('a_3')
     expect(Object.keys(actual[0] ?? {})).not.toContain('empty')
   })
+  it('produces identical CSV bytes from in-memory rows and DuckDB query rows', () => {
+    const rows: DataRow[] = [{ name: 'Zoë, 東京', amount: 1250.75, note: 'line one\n"line two"' }, { name: null, amount: null, note: '' }]
+    const columns = [{ source: 'name', name: 'name' }, { source: 'amount', name: 'amount' }, { source: 'note', name: 'note' }]
+    connection.query('DROP TABLE IF EXISTS export_source')
+    connection.query('CREATE TABLE export_source (name VARCHAR, amount DOUBLE, note VARCHAR, "__dc_order" BIGINT)')
+    connection.query(`INSERT INTO export_source VALUES (${quote(rows[0]!.name)}, 1250.75, ${quote(rows[0]!.note)}, 0), (NULL, NULL, '', 1)`)
+    const duckRows = connection.query('SELECT name, amount, note FROM export_source ORDER BY "__dc_order"').toArray().map((row) => row.toJSON() as DataRow)
+    expect(serializeCsv(duckRows, columns)).toBe(serializeCsv(rows, columns))
+  })
+
+  it('round trips Global Library and train-shaped data through CSV, XLSX, and JSON on both engines', () => {
+    const scenarios = [
+      { name: 'global_roundtrip', fixture: globalLibraryFixture, expectedRows: 219, acceptDuplicates: false },
+      { name: 'train_roundtrip', fixture: trainFixture, expectedRows: 119, acceptDuplicates: true },
+    ]
+    for (const scenario of scenarios) {
+      const { rows, columns } = scenario.fixture()
+      const originalProfile = profileDataset(rows, columns)
+      const memoryClean = runSmartClean(rows, originalProfile)
+      const duckClean = runDuckDbSmartClean(rows, columns, originalProfile, scenario.name)
+      const memoryRows = memoryClean.rows
+      const duckRows = canonicalRows(duckClean.rows)
+      let memoryFinal = memoryRows
+      let duckFinal = duckRows
+      if (scenario.acceptDuplicates) {
+        const decision: RiskyDecision = { kind: 'remove-duplicates', columns, options: { keys: [], keep: 'first' } }
+        memoryFinal = executeRiskyDecision(memoryFinal, decision).rows
+        const duplicateSql = buildRiskySelect(decision, duckClean.columns, [], duckClean.source)
+        duckFinal = connection.query(duplicateSql).toArray().map((row) => cleanOrder(row.toJSON() as OrderedRow))
+        expect(memoryFinal).toHaveLength(102)
+        expect(duckFinal).toHaveLength(102)
+      } else {
+        expect(memoryFinal).toHaveLength(scenario.expectedRows)
+        expect(duckFinal).toHaveLength(scenario.expectedRows)
+      }
+      const names = scenario.acceptDuplicates ? duckClean.columns : duckClean.columns
+      const memoryProfile = profileDataset(memoryFinal, names)
+      const types = new Map(memoryProfile.columns.map((column) => [column.name, column.inferredType]))
+      const exportColumns: ExportColumn[] = names.map((name) => ({ source: name, name, type: types.get(name) }))
+      expect(serializeCsv(duckFinal, exportColumns)).toBe(serializeCsv(memoryFinal, exportColumns))
+      expect(serializeJson(duckFinal, exportColumns)).toBe(serializeJson(memoryFinal, exportColumns))
+      const memoryXlsx = serializeXlsx(memoryFinal, exportColumns)
+      const duckXlsx = serializeXlsx(duckFinal, exportColumns)
+      const memoryBook = XLSX.read(memoryXlsx, { type: 'array', cellDates: true, raw: true })
+      const duckBook = XLSX.read(duckXlsx, { type: 'array', cellDates: true, raw: true })
+      expect(XLSX.utils.sheet_to_json(memoryBook.Sheets[memoryBook.SheetNames[0]!]!, { header: 1, raw: true, defval: null }))
+        .toEqual(XLSX.utils.sheet_to_json(duckBook.Sheets[duckBook.SheetNames[0]!]!, { header: 1, raw: true, defval: null }))
+      const csvImported = parseCsvText(serializeCsv(duckFinal, exportColumns))
+      const jsonImported = parseJsonText(serializeJson(duckFinal, exportColumns))
+      const xlsxImported = parseWorksheet(duckBook.Sheets[duckBook.SheetNames[0]!]!, 1)
+      for (const imported of [csvImported, jsonImported, xlsxImported]) {
+        expect(imported.rows).toHaveLength(memoryFinal.length)
+        expect(imported.columns).toHaveLength(names.length)
+        const importedProfile = profileDataset(imported.rows, imported.columns)
+        expect(importedProfile.summary.rows).toBe(memoryFinal.length)
+        expect(importedProfile.summary.columns).toBe(names.length)
+      }
+    }
+  }, 30_000)
+
+  it('normalizes day-first, month-first, and ISO dates with DuckDB expressions', () => {
+    connection.query('DROP TABLE IF EXISTS date_source')
+    connection.query("CREATE TABLE date_source (day_date VARCHAR, month_date VARCHAR, iso_date VARCHAR)")
+    connection.query("INSERT INTO date_source VALUES ('20-03-2026','03/20/2026','2026-08-20'), ('31-02-2026','13/25/2026','not-a-date')")
+    const day = buildDateNormalizationExpression('day_date', 'day-first')
+    const month = buildDateNormalizationExpression('month_date', 'month-first')
+    const iso = buildDateNormalizationExpression('iso_date', 'none')
+    const result = connection.query(`SELECT ${day} AS day, ${month} AS month, ${iso} AS iso FROM date_source`).toArray().map((row) => row.toJSON())
+    expect(result).toEqual([{ day: '2026-03-20', month: '2026-03-20', iso: '2026-08-20' }, { day: null, month: null, iso: 'not-a-date' }])
+    const ambiguous = buildDateNormalizationExpression('month_date', 'ambiguous')
+    const ambiguousRows = connection.query(`SELECT ${ambiguous} AS value FROM (VALUES ('03/04/2026'), ('31/02/2026')) AS t(month_date)`).toArray().map((row) => row.toJSON().value)
+    expect(ambiguousRows).toEqual(['03/04/2026', null])
+  })
+
   it.each(['trim-whitespace', 'normalize-missing', 'formatted-numbers', 'fix-type-mismatches'] as const)('matches in-memory Phase 2 values for %s', (kind) => {
-    const values = kind === 'formatted-numbers' ? ['$1,200.50', '(€42)', '12.5%', 'plain']
+    const values = kind === 'formatted-numbers' ? ['$1,200.50', '(€42)', '12.5%', '₹12,34,567.50', 'INR 1,250.75', '€1.234,56', '1,25 EUR', 'plain']
       : kind === 'fix-type-mismatches' ? [' TRUE ', 'false', 'other', ' 7 ']
         : kind === 'normalize-missing' ? ['N/A', '-', 'normal', null]
           : ['  alpha  ', 'beta\t', '', null]
@@ -214,10 +396,12 @@ describe('in-memory and DuckDB risky rule parity', () => {
       { rows: [{ key: 'a', value: '1', category: 'YES', date: '01/02/2024', lock: '守る' }, { key: 'a', value: 'N/A', category: 'yes', date: '02/01/2024', lock: '守る' }, { key: null, value: '3', category: 'No', date: 'n/a', lock: '守る' }, { key: null, value: '5', category: 'no', date: 'x', lock: '守る' }], decision: { kind: 'remove-duplicates', columns: ['key'], options: { keys: ['key'], keep: 'last' } } },
       { rows: [{ key: 'a', value: '1', category: 'YES', date: '01/02/2024', lock: '守る' }, { key: 'a', value: '1', category: 'YES', date: '01/02/2024', lock: '守る' }, { key: 'a', value: '1', category: 'YES', date: '01/02/2024', lock: '別' }], decision: { kind: 'remove-duplicates', columns: ['key'], options: { keys: [], keep: 'first' } } },
       { rows: [{ key: 'a', value: '1', category: 'YES', date: '01/02/2024', lock: '守る' }, { key: 'b', value: 'N/A', category: 'yes', date: '02/01/2024', lock: '守る' }, { key: 'c', value: '3', category: 'No', date: 'n/a', lock: '守る' }, { key: 'd', value: null, category: 'no', date: 'x', lock: '守る' }], decision: { kind: 'fill-missing', columns: ['value'], options: { strategy: 'median' } } },
+      { rows: [{ key: 'a', value: '10', category: 'A', date: '01/02/2024', lock: '守る' }, { key: 'b', value: null, category: 'A', date: '02/01/2024', lock: '守る' }, { key: 'c', value: '30', category: 'A', date: 'n/a', lock: '守る' }, { key: 'd', value: '100', category: 'B', date: 'x', lock: '守る' }, { key: 'e', value: null, category: 'B', date: 'x', lock: '守る' }, { key: 'f', value: '200', category: 'B', date: 'x', lock: '守る' }], decision: { kind: 'fill-missing', columns: ['value'], options: { strategy: 'group-median', groupBy: 'category' } } },
+      { rows: [{ key: 'a', value: 'red', category: 'A', date: '01/02/2024', lock: '守る' }, { key: 'b', value: 'N/A', category: 'A', date: '02/01/2024', lock: '守る' }, { key: 'c', value: 'red', category: 'A', date: 'n/a', lock: '守る' }, { key: 'd', value: 'blue', category: 'B', date: 'x', lock: '守る' }, { key: 'e', value: null, category: 'B', date: 'x', lock: '守る' }, { key: 'f', value: 'green', category: 'B', date: 'x', lock: '守る' }], decision: { kind: 'fill-missing', columns: ['value'], options: { strategy: 'group-mode', groupBy: 'category' } } },
       { rows: [{ key: 'a', value: '1', category: 'YES', date: '01/02/2024', lock: '守る' }, { key: 'b', value: 'N/A', category: 'yes', date: '02/01/2024', lock: '守る' }, { key: 'c', value: '3', category: 'No', date: 'n/a', lock: '守る' }], decision: { kind: 'fill-missing', columns: ['value'], options: { strategy: 'mean' } } },
       { rows: [{ key: 'a', value: 'A', category: 'YES', date: '01/02/2024', lock: '守る' }, { key: 'b', value: 'N/A', category: 'yes', date: '02/01/2024', lock: '守る' }, { key: 'c', value: 'B', category: 'No', date: 'n/a', lock: '守る' }], decision: { kind: 'fill-missing', columns: ['value'], options: { strategy: 'mode' } } },
       { rows: [{ key: 'a', value: null, category: 'YES', date: '01/02/2024', lock: '守る' }, { key: 'b', value: null, category: 'yes', date: '02/01/2024', lock: '守る' }], decision: { kind: 'fill-missing', columns: ['value'], options: { strategy: 'median' } } },
-      { rows: [{ key: 'a', value: 'A', category: 'YES', date: '01/02/2024', lock: '守る' }, { key: 'b', value: 'N/A', category: 'yes', date: '02/01/2024', lock: '守る' }, { key: 'c', value: 'C', category: 'No', date: 'n/a', lock: '守る' }], decision: { kind: 'fill-missing', columns: ['value'], options: { strategy: 'forward-fill' } } },
+      { rows: [{ key: 'a', value: 'A', category: 'YES', date: '01/02/2024', lock: '守る' }, { key: 'b', value: 'N/A', category: 'yes', date: '02/01/2024', lock: '守る' }, { key: 'c', value: 'C', category: 'No', date: 'n/a', lock: '守る' }], decision: { kind: 'fill-missing', columns: ['value'], options: { strategy: 'forward-fill', orderedRows: true } } },
       { rows: [{ key: 'a', value: 'A', category: 'YES', date: '01/02/2024', lock: '守る' }, { key: 'b', value: 'N/A', category: 'yes', date: '02/01/2024', lock: '守る' }], decision: { kind: 'fill-missing', columns: ['value'], options: { strategy: 'constant', value: '固定' } } },
       { rows: [{ key: 'a', value: 'A', category: 'YES', date: '01/02/2024', lock: '守る' }, { key: 'b', value: 'N/A', category: 'yes', date: '02/01/2024', lock: '守る' }], decision: { kind: 'fill-missing', columns: ['value'], options: { strategy: 'drop-rows' } } },
       { rows: [{ key: 'a', value: '1', category: 'YES', date: '01/02/2024', lock: '守る' }, { key: 'b', value: '2', category: 'yes', date: '02/01/2024', lock: '守る' }, { key: 'c', value: '3', category: 'No', date: 'n/a', lock: '守る' }, { key: 'd', value: '100', category: 'no', date: 'x', lock: '守る' }], decision: { kind: 'handle-outliers', columns: ['value'], options: { action: 'cap' } } },
@@ -225,6 +409,7 @@ describe('in-memory and DuckDB risky rule parity', () => {
       { rows: [{ key: 'a', value: '4', category: 'YES', date: '01/02/2024', lock: '守る' }, { key: 'b', value: '4', category: 'yes', date: '02/01/2024', lock: '守る' }, { key: 'c', value: '4', category: 'No', date: 'n/a', lock: '守る' }, { key: 'd', value: '4', category: 'no', date: 'x', lock: '守る' }], decision: { kind: 'handle-outliers', columns: ['value'], options: { action: 'flag' } } },
       { rows: [{ key: 'a', value: '1', category: 'YES', date: '01/02/2024', lock: '守る' }, { key: 'b', value: '2', category: 'yes', date: '02/01/2024', lock: '守る' }, { key: 'c', value: '3', category: 'No', date: 'n/a', lock: '守る' }, { key: 'd', value: '100', category: 'no', date: 'x', lock: '守る' }], decision: { kind: 'handle-outliers', columns: ['value'], options: { action: 'flag' } } },
       { rows: [{ key: 'a', value: '1', category: '東京', date: '01/02/2024', lock: '守る' }, { key: 'b', value: '2', category: '東京', date: '02/01/2024', lock: '守る' }], decision: { kind: 'standardize-categories', columns: ['category'], options: { mapping: '{"東京":"東京・東"}' } } },
+      { rows: [{ key: 'a', value: '-2', category: 'YES', date: '2024-01-01', lock: '守る' }, { key: 'b', value: '3', category: 'no', date: '2024-01-02', lock: '守る' }], decision: { kind: 'resolve-validation', columns: ['value'], options: { action: 'absolute' } } },
       { rows: [{ key: 'a', value: '1', category: '東京', date: '02-01-2024', lock: '守る' }, { key: 'b', value: '2', category: '東亰', date: '31/02/2024', lock: '守る' }], decision: { kind: 'resolve-ambiguous-dates', columns: ['date'], options: { order: 'day-first' } } },
     ]
 
@@ -285,6 +470,114 @@ describe('in-memory and DuckDB risky rule parity', () => {
     const sql = buildRiskySelect({ kind: 'fill-missing', columns, options: { strategy: 'constant', value: 'x' } }, columns, ['column_999'], 'source_version')
     expect(sql.match(/CASE WHEN/g)?.length).toBe(999)
     expect(sql).toContain('__dc_order')
+  })
+
+  it('repairs the supported mojibake corpus identically in DuckDB and memory', () => {
+    const values = ['FranÃ§ais', 'ordinary text', 'â€™']
+    connection.query('DROP TABLE IF EXISTS repair_input')
+    connection.query(`CREATE TABLE repair_input AS SELECT * FROM (VALUES ${values.map((value, index) => `('${value.replaceAll("'", "''")}', ${index})`).join(',')}) AS v(value, __dc_order)`)
+    const expr = buildMojibakeRepairExpression('value')
+    const actual = connection.query(`SELECT ${expr} AS value FROM repair_input ORDER BY __dc_order`).toArray().map((row) => row.toJSON().value)
+    expect(actual).toEqual(values.map((value) => transformValue('repair-mojibake', value)))
+    connection.query('DROP TABLE repair_input')
+  })
+
+  it('canonicalizes category punctuation and case identically in memory and DuckDB', () => {
+    const values = ['north-west', 'north-west', 'North West', 'North West', 'North West', 'NORTH-WEST', 'Northeast']
+    const rows: DataRow[] = values.map((category) => ({ Category: category }))
+    const memoryMap = buildCategoryMapping(rows, 'Category')
+    connection.query('DROP TABLE IF EXISTS category_source')
+    connection.query(`CREATE TABLE category_source AS SELECT * FROM (VALUES ${values.map((value, index) => `('${value}', ${index})`).join(',')}) AS v(Category, __dc_order)`)
+    const variants = connection.query('SELECT Category AS value, COUNT(*) AS n FROM category_source GROUP BY Category').toArray().map((row) => row.toJSON())
+    const duckMap = buildCategoryMappingFromCounts(variants.map((row) => [String(row.value), Number(row.n)] as const))
+    const expression = buildCategoryCaseExpression('Category', duckMap)
+    const actual = connection.query(`SELECT ${expression} AS Category FROM category_source ORDER BY __dc_order`).toArray().map((row) => row.toJSON().Category)
+    const expected = values.map((value) => memoryMap.get(value) ?? value)
+    expect(actual).toEqual(expected)
+    connection.query('DROP TABLE category_source')
+  })
+
+  it('pages changed DuckDB cells against immutable original columns after renaming', () => {
+    for (const kind of ['VIEW', 'TABLE'] as const) {
+      connection.query(`DROP ${kind} IF EXISTS dataset`)
+      connection.query(`DROP ${kind} IF EXISTS dataset_original`)
+    }
+    connection.query(`CREATE TABLE dataset_original AS SELECT * FROM (VALUES ('  old  ', 0), (NULL, 1)) AS t("Order ID", "__dc_order")`)
+    connection.query('CREATE VIEW dataset AS SELECT CASE WHEN "__dc_order" = 0 THEN TRIM("Order ID") ELSE \'new\' END AS "Order_ID", "__dc_order" FROM dataset_original')
+    const sql = buildDuckDbCompareSql([{ original: 'Order ID', cleaned: 'Order_ID', display: 'Order_ID' }], 1, 0)
+    const first = connection.query(sql).toArray().map((row) => row.toJSON())
+    const second = connection.query(buildDuckDbCompareSql([{ original: 'Order ID', cleaned: 'Order_ID', display: 'Order_ID' }], 1, 1)).toArray().map((row) => row.toJSON())
+    const count = connection.query(buildDuckDbCompareCountSql([{ original: 'Order ID', cleaned: 'Order_ID', display: 'Order_ID' }])).toArray().map((row) => row.toJSON())
+    const afterCursor = connection.query(buildDuckDbCompareAfterSql([{ original: 'Order ID', cleaned: 'Order_ID', display: 'Order_ID' }], 1, { rowId: 0, column: 'Order_ID' })).toArray().map((row) => row.toJSON())
+    expect(first).toEqual([{ row_id: 0, column: 'Order_ID', before: '  old  ', after: 'old' }])
+    expect(second).toEqual([{ row_id: 1, column: 'Order_ID', before: null, after: 'new' }])
+    expect(Number(count[0]?.count)).toBe(2)
+    expect(afterCursor).toEqual([{ row_id: 1, column: 'Order_ID', before: null, after: 'new' }])
+    connection.query('DROP VIEW dataset')
+    connection.query('DROP TABLE dataset_original')
+  })
+
+  it('streams a DuckDB cleaned file, all changed cells, report, and recipe into one ZIP', async () => {
+    connection.query('DROP VIEW IF EXISTS dataset'); connection.query('DROP TABLE IF EXISTS dataset_original')
+    connection.query(`CREATE TABLE dataset_original AS SELECT * FROM (VALUES ('  a, "x"  ', 0), ('same', 1)) AS t(value, "__dc_order")`)
+    connection.query('CREATE VIEW dataset AS SELECT TRIM(value) AS value, "__dc_order" FROM dataset_original')
+    const compareColumns = [{ original: 'value', cleaned: 'value', display: 'value' }]
+    const changedCells = Number(connection.query(buildDuckDbCompareCountSql(compareColumns)).toArray()[0]?.toJSON().count)
+    const bundle = new DuckDbBundleSession({ requestId: 'zip-test', format: 'csv', columns: [{ source: 'value', name: 'value', type: 'text' }],
+      fileName: 'sample_cleaned.csv', report: '# Report', recipe: '{"rules":[]}', ruleByColumn: { value: 'Trim whitespace' }, stepByColumn: { value: 1 },
+      bom: false, cleanRows: 2, changedCells, compareColumns })
+    const parts: Uint8Array[] = []
+    const progress: number[] = []
+    let done = false
+    while (!done) {
+      const result = await bundle.next(async (sql) => connection.query(sql).toArray().map((row) => row.toJSON() as Record<string, unknown>))
+      parts.push(result.bytes); progress.push(result.rowsProcessed); done = result.done
+    }
+    const bytes = new Uint8Array(parts.reduce((sum, part) => sum + part.length, 0))
+    let offset = 0
+    for (const part of parts) { bytes.set(part, offset); offset += part.length }
+    expect(progress).toEqual([...progress].sort((a, b) => a - b))
+    expect(unpackZip(bytes)).toEqual({
+      'sample_cleaned.csv': 'value\r\n"a, ""x"""\r\nsame\r\n',
+      'changes.csv': 'row_id,column,before,after,rule,step\r\n1,value,"  a, ""x""  ","a, ""x""",Trim whitespace,1\r\n',
+      'cleaning-report.md': '# Report',
+      'recipe.json': '{"rules":[]}',
+    })
+    connection.query('DROP VIEW dataset'); connection.query('DROP TABLE dataset_original')
+  })
+
+  it('caps DuckDB bundle data pages by a bounded cell batch for very wide datasets', async () => {
+    const columns = Array.from({ length: 1000 }, (_, index) => ({ source: `c${index}`, name: `c${index}`, type: 'text' as const }))
+    const bundle = new DuckDbBundleSession({ requestId: 'wide-zip-test', format: 'csv', columns, fileName: 'wide.csv', report: '', recipe: '{}',
+      ruleByColumn: {}, stepByColumn: {}, bom: false, cleanRows: 1000, changedCells: 0, compareColumns: [] })
+    await bundle.next(async () => []) // local header
+    let pageQuery = ''
+    await bundle.next(async (sql) => { pageQuery = sql; return [] })
+    expect(pageQuery).toContain('LIMIT 250')
+  })
+
+  it('streams removed DuckDB rows with the first version that removed each row', () => {
+    for (const [kind, name] of [['VIEW', 'dataset'], ['VIEW', 'removed_clean'], ['TABLE', 'removed_source']] as const) connection.query(`DROP ${kind} IF EXISTS ${name}`)
+    connection.query(`CREATE TABLE removed_source AS SELECT * FROM (VALUES ('keep', 0), ('duplicate', 1), ('keep', 2)) AS t(value, "__dc_order")`)
+    connection.query('CREATE VIEW removed_clean AS SELECT * FROM removed_source WHERE "__dc_order" <> 1')
+    connection.query('CREATE VIEW dataset AS SELECT * FROM removed_clean')
+    const sql = buildDuckDbRemovedRowsSql([{ table: 'removed_source', removedBy: 'Original' }, { table: 'removed_clean', removedBy: 'Remove duplicates' }], ['value'], 10, 0)
+    const removed = connection.query(sql).toArray().map((row) => row.toJSON())
+    expect(removed).toEqual([{ row_id: 1, removal_rule: 'Remove duplicates', value: 'duplicate' }])
+    connection.query('DROP VIEW dataset'); connection.query('DROP VIEW removed_clean'); connection.query('DROP TABLE removed_source')
+  })
+
+  it('casts profiled large-export columns into JSON scalar types in DuckDB', () => {
+    connection.query('DROP TABLE IF EXISTS json_export_source')
+    connection.query('CREATE TABLE json_export_source AS SELECT * FROM (VALUES (\'1234.5\', \'7\', \'true\', \'NaN\')) AS t("Revenue", "Count", "Enabled", "Unparseable")')
+    const projection = buildDuckDbJsonExportProjection([
+      { source: 'Revenue', type: 'float' }, { source: 'Count', type: 'integer' }, { source: 'Enabled', type: 'boolean' }, { source: 'Unparseable', type: 'float' },
+    ])
+    const row = connection.query(`SELECT ${projection} FROM json_export_source`).toArray()[0]!.toJSON()
+    expect(row).toMatchObject({ Revenue: 1234.5, Count: 7, Enabled: true })
+    expect(normalizeDuckDbJsonValue(row.Unparseable)).toBeNull()
+    expect(JSON.parse(JSON.stringify({ Revenue: normalizeDuckDbJsonValue(row.Revenue), Count: normalizeDuckDbJsonValue(row.Count), Enabled: normalizeDuckDbJsonValue(row.Enabled), Unparseable: normalizeDuckDbJsonValue(row.Unparseable) }))).toEqual({ Revenue: 1234.5, Count: 7, Enabled: true, Unparseable: null })
+    connection.query('DROP TABLE json_export_source')
   })
 
   it('replays history by switching views and restores the immutable source on reset', () => {

@@ -1,5 +1,6 @@
 import { z } from 'zod'
 import type { ColumnIssue, ColumnProfile, DataRow, DataValue, InferredType, IssueSeverity, ProfileResult } from '../types'
+import { currencySignature, parseFormattedNumber } from '../cleaners/rules'
 
 const severitySchema = z.enum(['info', 'warning', 'error'])
 const issueSchema = z.object({ code: z.string(), severity: severitySchema, message: z.string(), count: z.number().int().nonnegative().optional() })
@@ -10,7 +11,7 @@ const profileSchema = z.object({
   mean: z.number().nullable(), median: z.number().nullable(), topValues: z.array(z.object({ value: z.union([z.string(), z.number(), z.boolean(), z.null()]), count: z.number().int().positive() })),
   mixedTypeCount: z.number().int().nonnegative(), leadingWhitespaceCount: z.number().int().nonnegative(), trailingWhitespaceCount: z.number().int().nonnegative(),
   inconsistentCasingCount: z.number().int().nonnegative(), invalidEmailCount: z.number().int().nonnegative(), invalidPhoneCount: z.number().int().nonnegative(),
-  invalidDateCount: z.number().int().nonnegative(), iqrOutlierCount: z.number().int().nonnegative(), issues: z.array(issueSchema),
+  invalidDateCount: z.number().int().nonnegative(), iqrOutlierCount: z.number().int().nonnegative(), currencySymbols: z.array(z.string()).default([]), issues: z.array(issueSchema),
 })
 const summarySchema = z.object({ rows: z.number().int().nonnegative(), columns: z.number().int().nonnegative(), fullyDuplicateRows: z.number().int().nonnegative(), fullyEmptyRows: z.number().int().nonnegative(), fullyEmptyColumns: z.number().int().nonnegative(), nullCells: z.number().int().nonnegative(), memoryEstimateBytes: z.number().nonnegative() })
 export const profileResultSchema = z.object({ summary: summarySchema, columns: z.array(profileSchema), datasetIssues: z.array(issueSchema) })
@@ -76,7 +77,10 @@ export function profileColumn(name: string, values: DataValue[], id = `column:${
   let invalidPhoneCount = 0
   let invalidDateCount = 0
   const distinctSpellings = new Map<string, Set<string>>()
+  const currencies = new Set<string>()
   const candidateDateColumn = /date|time|dob|birth|joined|created|updated/i.test(name)
+  const candidateQuantityColumn = /quantity|qty/i.test(name)
+  const candidateProfitColumn = /profit/i.test(name)
   const candidatePhoneColumn = /phone|mobile|tel/i.test(name)
   const candidateEmailColumn = /email|e-mail/i.test(name)
 
@@ -88,6 +92,8 @@ export function profileColumn(name: string, values: DataValue[], id = `column:${
     if (existing) existing.count += 1
     else counts.set(key, { value, count: 1 })
     if (typeof value === 'string') {
+      const currency = currencySignature(value)
+      if (currency) currencies.add(currency)
       if (/^\s/.test(value)) leadingWhitespaceCount += 1
       if (/\s$/.test(value)) trailingWhitespaceCount += 1
       const trimmed = value.trim()
@@ -104,6 +110,11 @@ export function profileColumn(name: string, values: DataValue[], id = `column:${
   const numericValues = present.map((value) => Number(value)).filter(Number.isFinite)
   const quartiles = numericQuartiles(numericValues)
   const iqrOutlierCount = quartiles ? numericValues.filter((value) => value < quartiles.low || value > quartiles.high).length : 0
+  const domainNumbers = present.map((value) => parseFormattedNumber(value)).filter((value): value is number => typeof value === 'number')
+  const negativeQuantityCount = candidateQuantityColumn ? domainNumbers.filter((value) => value < 0).length : 0
+  const negativeProfitCount = candidateProfitColumn ? domainNumbers.filter((value) => value < 0).length : 0
+  const today = new Date(); today.setHours(23, 59, 59, 999)
+  const futureDateCount = candidateDateColumn ? present.filter((value) => typeof value === 'string' && (parseDateValue(value)?.getTime() ?? 0) > today.getTime()).length : 0
   const typeFamilies = new Set(present.map((value) => {
     const kind = kindOf(value)
     return kind === 'integer' || kind === 'float' ? 'number' : kind
@@ -115,6 +126,7 @@ export function profileColumn(name: string, values: DataValue[], id = `column:${
   const median = numericSorted.length ? numericSorted.length % 2 ? numericSorted[middle]! : (numericSorted[middle - 1]! + numericSorted[middle]!) / 2 : null
   const nullCount = values.length - present.length
   const duplicateValueCount = [...counts.values()].reduce((sum, item) => sum + Math.max(item.count - 1, 0), 0)
+  const identifierColumn = /(?:^|[ _-])(?:id|identifier|code)(?:$|[ _-])/i.test(name) && present.length > 1 && counts.size / present.length >= 0.8
   const casingGroups = [...distinctSpellings.values()].filter((spellings) => spellings.size > 1)
   const inconsistentCasingCount = casingGroups.reduce((sum, spellings) => sum + spellings.size, 0)
   const issues: ColumnIssue[] = []
@@ -127,6 +139,11 @@ export function profileColumn(name: string, values: DataValue[], id = `column:${
   addIssue(issues, 'invalid-phone', 'warning', 'Phone values should contain 7 to 15 digits.', invalidPhoneCount)
   addIssue(issues, 'invalid-date', 'error', 'Date values could not be parsed consistently.', invalidDateCount)
   addIssue(issues, 'iqr-outliers', 'info', 'Numeric values outside the 1.5× IQR range.', iqrOutlierCount)
+  addIssue(issues, 'mixed-currency', 'warning', `Values contain multiple currency families: ${[...currencies].sort().join(', ')}.`, currencies.size > 1 ? currencies.size : 0)
+  addIssue(issues, 'negative-quantity', 'warning', 'Negative quantities require review.', negativeQuantityCount)
+  addIssue(issues, 'negative-profit', 'warning', 'Negative profit values require review.', negativeProfitCount)
+  addIssue(issues, 'future-date', 'warning', 'Dates later than today require review.', futureDateCount)
+  addIssue(issues, 'identifier-column', 'info', 'This high-uniqueness ID/code column is excluded from automatic imputation.', identifierColumn ? present.length : 0)
 
   return {
     id, name, inferredType: type, nullCount, nullPercent: values.length ? (nullCount / values.length) * 100 : 0,
@@ -134,7 +151,7 @@ export function profileColumn(name: string, values: DataValue[], id = `column:${
     max: numericValues.length === present.length && present.length ? numericValues.reduce((max, value) => Math.max(max, value), Number.NEGATIVE_INFINITY) : sortedValues.at(-1) ?? null,
     mean: numericValues.length ? numericValues.reduce((sum, value) => sum + value, 0) / numericValues.length : null,
     median, topValues: [...counts.values()].sort((a, b) => b.count - a.count || String(a.value).localeCompare(String(b.value))).slice(0, 5),
-    mixedTypeCount, leadingWhitespaceCount, trailingWhitespaceCount, inconsistentCasingCount, invalidEmailCount, invalidPhoneCount, invalidDateCount, iqrOutlierCount, issues,
+    mixedTypeCount, leadingWhitespaceCount, trailingWhitespaceCount, inconsistentCasingCount, invalidEmailCount, invalidPhoneCount, invalidDateCount, iqrOutlierCount, currencySymbols: [...currencies].sort(), issues,
   }
 }
 

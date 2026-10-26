@@ -3,8 +3,12 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { resolve } from 'node:path'
 import * as duckdb from '@duckdb/duckdb-wasm/dist/duckdb-node-blocking'
 import { buildLowRiskExpression } from './lowRiskSql'
-import { buildRiskySelect, quoteSqlIdentifier } from './riskySql'
-import type { RiskyDecision } from '../types'
+import { buildRiskySelect, quoteSqlIdentifier, quoteSqlString } from './riskySql'
+import { buildDuckDbImputationViewSql, processDuckDbEstimateBatches } from './duckdbImputation'
+import { recommendMissingValues, selectImputationTrainingSample } from './localImputation'
+import { buildDuckDbCompareCountSql } from './duckdbCompare'
+import { DuckDbBundleSession } from './duckdbBundle'
+import type { DataRow, RiskyDecision } from '../types'
 
 const rowCount = 100_000
 const columnCount = 1_000
@@ -106,5 +110,78 @@ describe('combined DuckDB scale path (run with npm run test:scale)', () => {
     const activeDefinition = String(queryRows("SELECT view_definition FROM information_schema.views WHERE table_name = 'scale_active'")[0]?.view_definition ?? '')
     expect(activeDefinition.toLowerCase()).toContain('scale_original')
     console.log(JSON.stringify({ scaleSeconds: Number(((performance.now() - started) / 1000).toFixed(2)), peakRssBytes: peakRss, rows: rowCount, columns: columnCount, riskyDecisionsAccepted: decisions.length, restoredExactly: true }))
+  }, 600_000)
+
+  it('validates and applies estimates to a 100k-row DuckDB dataset in bounded pages', async () => {
+    const started = performance.now()
+    connection.query('DROP VIEW IF EXISTS estimate_scale_result')
+    connection.query('DROP TABLE IF EXISTS estimate_scale_values')
+    connection.query('DROP TABLE IF EXISTS estimate_scale_source')
+    connection.query(`CREATE TABLE estimate_scale_source AS SELECT i AS signal, CASE WHEN i % 20 = 0 THEN NULL ELSE i * 3 + 1 END AS target, i AS "__dc_order" FROM range(${rowCount}) AS source(i)`)
+    const sampled = queryRows(`SELECT signal, target, "__dc_order" FROM estimate_scale_source ORDER BY HASH("__dc_order"), "__dc_order" LIMIT 50000`) as DataRow[]
+    const seed = 101
+    const [recommendation] = recommendMissingValues(sampled, ['target'], ['signal'], seed, { target: 5 }, { target: 'integer' }, 5000)
+    expect(recommendation?.recommended).toBe(true)
+    expect(recommendation?.validation).toMatchObject({ kind: 'numeric', model: 'ridge-regression' })
+    const trainingRows = selectImputationTrainingSample(sampled, seed, 5000)
+    connection.query('CREATE TABLE estimate_scale_values ("__dc_order" BIGINT, "__dc_column" VARCHAR, "estimate_value" VARCHAR, "uncertainty" DOUBLE)')
+    let cursor = -1
+    async function* targetPages() {
+      while (true) {
+        const batch = queryRows(`SELECT signal, target, "__dc_order" FROM estimate_scale_source WHERE target IS NULL AND "__dc_order" > ${cursor} ORDER BY "__dc_order" LIMIT 2000`) as DataRow[]
+        if (!batch.length) return
+        cursor = Number(batch[batch.length - 1]?.__dc_order ?? cursor)
+        yield batch
+      }
+    }
+    let lastProcessed = 0
+    const batchResult = await processDuckDbEstimateBatches(targetPages(), {
+      trainingRows, target: 'target', features: ['signal'], targetType: 'integer', model: recommendation?.validation?.kind === 'numeric' ? recommendation.validation.model : 'weighted-knn', integerTarget: true, nonNegative: true,
+      insertBatch: async (batch) => { connection.query(`INSERT INTO estimate_scale_values VALUES ${batch.map((item) => `(${item.rowOrder}, 'target', ${quoteSqlString(String(item.value))}, ${item.uncertainty})`).join(', ')}`) },
+      onProgress: (processed) => { expect(processed).toBeGreaterThan(lastProcessed); lastProcessed = processed },
+    })
+    expect(batchResult).toMatchObject({ processedRows: 5000, estimatedCells: 5000, cancelled: false })
+    connection.query(`CREATE VIEW estimate_scale_result AS ${buildDuckDbImputationViewSql('estimate_scale_source', 'estimate_scale_values', ['signal', 'target'], 'target', undefined, 'integer')}`)
+    const profileCounts = queryRows('SELECT COUNT(*) AS rows, COUNT(*) FILTER (WHERE target IS NULL) AS nulls FROM estimate_scale_result')[0]
+    const originalNulls = queryRows('SELECT COUNT(*) FILTER (WHERE target IS NULL) AS nulls FROM estimate_scale_source')[0]
+    expect(Number(profileCounts?.rows)).toBe(rowCount)
+    expect(Number(profileCounts?.nulls)).toBe(0)
+    expect(Number(originalNulls?.nulls)).toBe(5000)
+    console.log(JSON.stringify({ estimateSeconds: Number(((performance.now() - started) / 1000).toFixed(2)), peakRssBytes: peakRss, rows: rowCount, trainingRows: trainingRows.length, model: recommendation!.validation!.model, processedRows: batchResult.processedRows, cellsEstimated: batchResult.estimatedCells }))
+    connection.query('DROP VIEW estimate_scale_result'); connection.query('DROP TABLE estimate_scale_values'); connection.query('DROP TABLE estimate_scale_source')
+  }, 600_000)
+
+  it('streams a generated 1M-row DuckDB bundle in bounded chunks without retaining the archive', async () => {
+    const started = performance.now()
+    const rows = 1_000_000
+    for (const [kind, name] of [['VIEW', 'dataset'], ['TABLE', 'dataset_original']] as const) connection.query(`DROP ${kind} IF EXISTS ${name}`)
+    connection.query(`CREATE TABLE dataset_original AS SELECT CAST(i AS BIGINT) AS id, CAST(i AS VARCHAR) AS value, i AS "__dc_order" FROM range(${rows}) AS source(i)`)
+    connection.query('CREATE VIEW dataset AS SELECT id, CASE WHEN "__dc_order" = 0 THEN \'changed\' ELSE value END AS value, "__dc_order" FROM dataset_original')
+    const compareColumns = [{ original: 'value', cleaned: 'value', display: 'value' }]
+    const changedCells = Number(queryRows(buildDuckDbCompareCountSql(compareColumns))[0]?.count)
+    const session = new DuckDbBundleSession({ requestId: 'million-scale', format: 'csv', columns: [{ source: 'id', name: 'id', type: 'integer' }, { source: 'value', name: 'value', type: 'text' }],
+      fileName: 'million.csv', report: '# report', recipe: '{}', ruleByColumn: { value: 'Trim whitespace' }, stepByColumn: { value: 1 }, bom: false,
+      cleanRows: rows, changedCells, compareColumns })
+    let bytesWritten = 0
+    let maxChunkBytes = 0
+    let chunks = 0
+    let lastRowsProcessed = 0
+    let done = false
+    while (!done) {
+      const result = await session.next(async (sql) => queryRows(sql))
+      bytesWritten += result.bytes.byteLength
+      maxChunkBytes = Math.max(maxChunkBytes, result.bytes.byteLength)
+      chunks += 1
+      expect(result.rowsProcessed).toBeGreaterThanOrEqual(lastRowsProcessed)
+      lastRowsProcessed = result.rowsProcessed
+      done = result.done
+    }
+    expect(changedCells).toBe(1)
+    expect(lastRowsProcessed).toBe(rows + 1)
+    expect(chunks).toBeGreaterThan(200)
+    expect(maxChunkBytes).toBeLessThan(1_000_000)
+    expect(bytesWritten).toBeGreaterThan(10_000_000)
+    console.log(JSON.stringify({ bundleSeconds: Number(((performance.now() - started) / 1000).toFixed(2)), peakRssBytes: peakRss, rows, bytesWritten, maxChunkBytes, chunks }))
+    connection.query('DROP VIEW dataset'); connection.query('DROP TABLE dataset_original')
   }, 600_000)
 })

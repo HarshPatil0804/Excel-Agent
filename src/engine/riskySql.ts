@@ -20,6 +20,8 @@ export function buildRiskySelect(decision: RiskyDecision, columns: string[], pro
   }
   if (decision.kind === 'fill-missing') {
     const strategy = typeof decision.options.strategy === 'string' ? decision.options.strategy : 'mode'
+    const groupBy = typeof decision.options.groupBy === 'string' ? decision.options.groupBy : ''
+    if (strategy === 'forward-fill' && decision.options.orderedRows !== true) throw new Error('Forward fill requires confirmation that rows are ordered by time or sequence.')
     if (strategy === 'drop-rows') {
       const predicate = selected.map((name) => isMissing(quoteSqlIdentifier(name))).join(' OR ')
       where = predicate ? ` WHERE NOT (${predicate})` : ''
@@ -31,6 +33,20 @@ export function buildRiskySelect(decision: RiskyDecision, columns: string[], pro
           : strategy === 'forward-fill' ? `LAST_VALUE(NULLIF(CASE WHEN ${isMissing(column)} THEN NULL ELSE CAST(${column} AS VARCHAR) END, '') IGNORE NULLS) OVER (ORDER BY __dc_order ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)`
             : strategy === 'mode' ? `(SELECT CAST(${column} AS VARCHAR) FROM ${source} WHERE NOT ${isMissing(column)} GROUP BY ${column} ORDER BY COUNT(*) DESC, CAST(${column} AS VARCHAR) ASC LIMIT 1)`
               : strategy === 'mean' ? `(SELECT CAST(AVG(TRY_CAST(${column} AS DOUBLE)) AS VARCHAR) FROM ${source} WHERE TRY_CAST(${column} AS DOUBLE) IS NOT NULL)`
+                : strategy === 'group-median' || strategy === 'group-mode' ? (() => {
+                  if (!groupBy || !columns.includes(groupBy) || groupBy === column.slice(1, -1).replaceAll('""', '"')) return 'NULL'
+                  const alias = 'group_source'
+                  const groupedTarget = `${alias}.${column}`
+                  const groupedColumn = `${alias}.${quoteSqlIdentifier(groupBy)}`
+                  const groupMatch = `${groupedColumn} IS NOT DISTINCT FROM ${source}.${quoteSqlIdentifier(groupBy)}`
+                  const valueFilter = strategy === 'group-median' ? `TRY_CAST(${groupedTarget} AS DOUBLE) IS NOT NULL` : `NOT ${isMissing(groupedTarget)}`
+                  const aggregate = strategy === 'group-median'
+                    ? `CAST(MEDIAN(TRY_CAST(${groupedTarget} AS DOUBLE)) AS VARCHAR)`
+                    : `CAST((SELECT ${groupedTarget} FROM ${source} AS ${alias} WHERE ${groupMatch} AND ${valueFilter} GROUP BY ${groupedTarget} ORDER BY COUNT(*) DESC, CAST(${groupedTarget} AS VARCHAR) ASC LIMIT 1) AS VARCHAR)`
+                  return strategy === 'group-median'
+                    ? `(SELECT ${aggregate} FROM ${source} AS ${alias} WHERE ${groupMatch} AND ${valueFilter})`
+                    : aggregate
+                })()
                 : `(SELECT CAST(MEDIAN(TRY_CAST(${column} AS DOUBLE)) AS VARCHAR) FROM ${source} WHERE TRY_CAST(${column} AS DOUBLE) IS NOT NULL)`
         return `CASE WHEN ${isMissing(column)} THEN COALESCE(${replacement}, CAST(${column} AS VARCHAR)) ELSE CAST(${column} AS VARCHAR) END AS ${column}`
       }).join(', ')
@@ -69,6 +85,16 @@ export function buildRiskySelect(decision: RiskyDecision, columns: string[], pro
         const high = `(${q3} + 1.5 * ${spread})`
         const number = `TRY_CAST(${c} AS DOUBLE)`
         return `CASE WHEN ${number} IS NOT NULL AND (${number} < ${low} OR ${number} > ${high}) THEN CAST(GREATEST(${low}, LEAST(${high}, ${number})) AS VARCHAR) ELSE ${c} END AS ${c}`
+      }).join(', ')
+    }
+  } else if (decision.kind === 'resolve-validation') {
+    if (action === 'empty' || action === 'absolute') {
+      projection = refs.map((column) => {
+        const name = column.slice(1, -1).replaceAll('""', '"')
+        if (!selected.includes(name)) return column
+        const number = `TRY_CAST(REGEXP_REPLACE(CAST(${column} AS VARCHAR), '[,$£€¥₹ ]', '', 'g') AS DOUBLE)`
+        const replacement = action === 'empty' ? 'NULL' : `CAST(ABS(${number}) AS VARCHAR)`
+        return `CASE WHEN ${number} < 0 THEN ${replacement} ELSE ${column} END AS ${column}`
       }).join(', ')
     }
   } else if (decision.kind === 'standardize-categories') {

@@ -56,10 +56,12 @@ export const useDatasetStore = create<DatasetState>((set) => ({
     const historyProfiles = state.dataset?.largeFileMode || !state.originalProfile || !state.profile ? [] : state.historyProfiles.length ? [...state.historyProfiles.slice(0, state.historyCursor + 1), state.profile] : [state.originalProfile, state.profile]
     const rowsRemoved = cleanResult.groups.reduce((sum, group) => sum + (group.rowsRemoved ?? 0), 0)
     const cellsChanged = cleanResult.groups.reduce((sum, group) => sum + (group.cellsChanged ?? 0), 0)
+    const cellsEstimated = cleanResult.groups.reduce((sum, group) => sum + (group.cellsEstimated ?? 0), 0)
     const columnsRenamed = cleanResult.groups.reduce((sum, group) => sum + (group.columnsRenamed ?? 0), 0)
     const flaggedCells = cleanResult.groups.reduce((sum, group) => sum + (group.cellsFlagged ?? 0), 0)
     const currentCount = state.changeSteps.length ? state.dataset?.largeFileMode ? state.dataset.rowCount : state.historySnapshots[state.historyCursor]?.length ?? state.profile?.summary.rows ?? originalCount : originalCount
-    const newStep: ChangeStep = { id: crypto.randomUUID(), label: 'Smart Clean automatic rules', ruleId: 'smart-clean', scope: { mode: 'all' }, timestamp: new Date().toISOString(), rowsBefore: currentCount, rowsAfter: resultCount, rowsRemoved, cellsChanged, columnsRenamed, flaggedCells, samples: [], undone: false }
+    const removedRowIds = cleanResult.groups.flatMap((group) => group.removedRowIds ?? [])
+    const newStep: ChangeStep = { id: crypto.randomUUID(), label: 'Smart Clean automatic rules', ruleId: 'smart-clean', scope: { mode: 'all' }, timestamp: new Date().toISOString(), rowsBefore: currentCount, rowsAfter: resultCount, rowsRemoved, ...(removedRowIds.length ? { removedRowIds } : {}), cellsChanged, cellsEstimated, columnsRenamed, flaggedCells, samples: [], undone: false }
     const changeSteps = [...state.changeSteps.slice(0, state.historyCursor || state.changeSteps.length), newStep]
     return { cleanResult, decisionStates: Object.fromEntries(cleanResult.proposed.map((proposal) => [proposal.rule.id, 'pending' as const])), dataset: state.dataset ? { ...state.dataset, rowCount: resultCount, columnCount: state.profile?.summary.columns ?? state.dataset.columnCount } : null, ...(state.dataset?.largeFileMode ? {} : { rows: cleanResult.rows, previewRows: cleanResult.rows.slice(0, 1000) }), historySnapshots, historyProfiles, historyCursor: state.dataset?.largeFileMode ? changeSteps.length : historySnapshots.length ? historySnapshots.length - 1 : 0, changeSteps, cleanProgress: null }
   }),

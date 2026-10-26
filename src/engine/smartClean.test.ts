@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import { profileDataset } from '../profiler/profile'
-import { countUnresolvedProposals, matchRecipe, runSmartClean, createRecipe, buildSmartCleanPlan, LOW_RISK_RULES } from './smartClean'
-import type { CleaningRule, ColumnProfile, DataRow, ProfileResult } from '../types'
+import { countUnresolvedProposals, matchRecipe, runSmartClean, createRecipe, buildSmartCleanPlan, LOW_RISK_RULES, rankRiskyProposals } from './smartClean'
+import type { CleaningRule, ColumnProfile, DataRow, PlannedRule, ProfileResult } from '../types'
 import { globalLibraryFixture, trainFixture } from '../../tests/fixtures/smartCleanRegression'
 import { executeRiskyDecision } from './riskyDecisions'
 import { useDatasetStore } from '../store/datasetStore'
@@ -82,6 +82,80 @@ describe('Smart Clean', () => {
     store.clear()
   })
 
+  it('records stable source row IDs for automatic empty-row removals', () => {
+    const rows: DataRow[] = [
+      { value: 'a', __dc_internal_row_order: 0 }, { value: 'b', __dc_internal_row_order: 1 },
+      { value: 'c', __dc_internal_row_order: 2 }, { value: 'd', __dc_internal_row_order: 3 },
+      { value: null, __dc_internal_row_order: 4 },
+    ]
+    const result = runSmartClean(rows, profileDataset(rows, ['value']), [], undefined, undefined, {}, '__dc_internal_row_order')
+    expect(result.rows).toHaveLength(4)
+    expect(result.groups.find((group) => group.ruleId === 'remove-empty-rows')).toMatchObject({ rowsRemoved: 1, removedRowIds: [4] })
+  })
+
+  it('repairs mojibake in ordinary text as a dataset-wide low-risk rule', () => {
+    const rows: DataRow[] = [{ City: 'MontrÃ©al' }, { City: 'Zürich' }]
+    const result = runSmartClean(rows, buildProfile(rows, ['City']))
+    expect(result.rows.map((row) => row.city)).toEqual(['Montréal', 'Zürich'])
+    expect(result.groups.find((group) => group.ruleId === 'repair-mojibake')?.cellsChanged).toBe(1)
+  })
+
+  it('requires a 90% parse rate before converting a mixed text column and records mixed currencies', () => {
+    const lowRate: DataRow[] = [{ Revenue: '$1.00' }, { Revenue: 'not numeric' }, { Revenue: 'other text' }]
+    const lowProfile = buildProfile(lowRate, ['Revenue'])
+    expect(lowProfile.columns[0]?.currencySymbols).toEqual(['USD'])
+    expect(runSmartClean(lowRate, lowProfile).rows).toEqual(lowRate.map((row) => ({ revenue: row.Revenue })))
+    const mixed: DataRow[] = [{ Revenue: '$1.00' }, { Revenue: '€2.00' }, { Revenue: 'N/A' }]
+    const profile = buildProfile(mixed, ['Revenue'])
+    expect(profile.columns[0]?.currencySymbols).toEqual(['EUR', 'USD'])
+    expect(profile.columns[0]?.issues.some((issue) => issue.code === 'mixed-currency')).toBe(true)
+    const result = runSmartClean(mixed, profile)
+    expect(result.rows.map((row) => row.revenue)).toEqual([1, 2, null])
+  })
+
+  it('canonicalizes punctuation and case using the most frequent spelling without fuzzy merging', () => {
+    const rows: DataRow[] = [
+      { Category: 'north-west' }, { Category: 'north-west' }, { Category: 'North West' },
+      { Category: 'North West' }, { Category: 'North West' }, { Category: 'NORTH-WEST' },
+      { Category: 'Northeast' },
+    ]
+    const result = runSmartClean(rows, buildProfile(rows, ['Category']))
+    expect(result.rows.map((row) => row.category)).toEqual(['North West', 'North West', 'North West', 'North West', 'North West', 'North West', 'Northeast'])
+    expect(result.groups.find((group) => group.ruleId === 'canonicalize-categories')).toMatchObject({ cellsChanged: 3, rowsRemoved: 0 })
+    expect(result.proposed.some((item) => item.rule.kind === 'standardize-categories')).toBe(false)
+  })
+
+  it('keeps high-confidence fuzzy spelling suggestions as pending risky proposals', () => {
+    const rows: DataRow[] = [{ Region: 'Californa' }, { Region: 'California' }, { Region: 'California' }]
+    const result = runSmartClean(rows, buildProfile(rows, ['Region']))
+    const proposal = result.proposed.find((item) => item.rule.kind === 'standardize-categories')
+    expect(proposal?.columns).toEqual(['Region'])
+    expect(proposal?.status).toBe('pending')
+    expect(result.rows.map((row) => row.region)).toEqual(['Californa', 'California', 'California'])
+  })
+
+  it('proposes negative quantity/profit validation without changing data', () => {
+    const rows: DataRow[] = [{ Quantity: '-2', Profit: '-3' }, { Quantity: '4', Profit: '8' }]
+    const result = runSmartClean(rows, buildProfile(rows, ['Quantity', 'Profit']))
+    expect(result.rows.map((row) => [row.quantity, row.profit])).toEqual([[-2, -3], [4, 8]])
+    const proposal = result.proposed.find((item) => item.rule.kind === 'resolve-validation')
+    expect(proposal?.columns).toEqual(['Quantity', 'Profit'])
+    expect(proposal?.status).toBe('pending')
+  })
+
+  it('excludes identifier and free-text columns from default missing-value proposals', () => {
+    const rows: DataRow[] = Array.from({ length: 20 }, (_, index) => ({
+      Amount: index === 0 ? null : index,
+      'Customer ID': index === 0 ? null : `C-${index}`,
+      Description: index === 0 ? null : `unique description ${index}`,
+    }))
+    const profile = buildProfile(rows, ['Amount', 'Customer ID', 'Description'])
+    const fillPlan = buildSmartCleanPlan(profile).find((item) => item.rule.kind === 'fill-missing')!
+    expect(fillPlan.columns).toEqual(['Amount'])
+    expect(fillPlan.excludedColumns).toEqual(expect.arrayContaining(['Customer ID', 'Description']))
+    expect(fillPlan.deferredColumns).toBeUndefined()
+  })
+
   it('keeps train.csv shaped duplicates as a proposal until the user accepts removal', () => {
     const { rows, columns } = trainFixture()
     const result = runSmartClean(rows, buildProfile(rows, columns))
@@ -98,16 +172,20 @@ describe('Smart Clean', () => {
   })
 
   it('creates risky proposals only for existing issues and defers high-missing columns', () => {
-    const rows = Array.from({ length: 100 }, (_, index) => ({ low_missing: index < 5 ? null : `v${index}`, high_missing: index < 20 ? null : `v${index}` }))
+    const rows = Array.from({ length: 100 }, (_, index) => ({ low_missing: index < 5 ? null : index % 2 ? 'north' : 'south', high_missing: index < 20 ? null : index % 2 ? 'north' : 'south' }))
     const profile = buildProfile(rows, ['low_missing', 'high_missing'])
     const plan = buildSmartCleanPlan(profile)
     const fill = plan.find((item) => item.rule.kind === 'fill-missing')
     expect(fill?.columns).toContain('low_missing')
     expect(fill?.columns).not.toContain('high_missing')
     expect(fill?.deferredColumns).toContain('high_missing')
+    expect(fill?.proposed).toBe(true)
+    expect(fill?.status).toBe('pending')
     const cleaned = runSmartClean(rows, profile)
     expect(cleaned.groups.find((group) => group.ruleId === 'fill-missing-deferred')).toMatchObject({ cellsFlagged: 20, cellsChanged: 0, rowsRemoved: 0 })
     expect(buildSmartCleanPlan(buildProfile([{ a: 'x' }, { a: 'y' }], ['a'])).some((item) => item.rule.kind === 'remove-duplicates' && item.proposed)).toBe(false)
+    const onlyHighMissing = buildSmartCleanPlan(buildProfile(Array.from({ length: 100 }, (_, index) => ({ amount: index < 30 ? null : index })), ['amount']))
+    expect(onlyHighMissing.find((item) => item.rule.kind === 'fill-missing')).toMatchObject({ columns: [], deferredColumns: ['amount'], proposed: true, status: 'pending' })
     const leftAlone = executeRiskyDecision(rows, { kind: 'fill-missing', columns: ['low_missing'], options: { strategy: 'leave-null' } })
     expect(leftAlone.result.cellsChanged).toBe(0)
     expect(leftAlone.rows).toEqual(rows)
@@ -123,6 +201,22 @@ describe('Smart Clean', () => {
     expect(countUnresolvedProposals([proposal], { [proposal.rule.id]: 'accepted' })).toBe(0)
   })
 
+  it('ranks risky proposals by estimated affected-cell impact with stable ties', () => {
+    const profile = buildProfile([
+      { key: 'a', value: 1, missing: null }, { key: 'a', value: 1, missing: null },
+      { key: 'b', value: 2, missing: null }, { key: 'b', value: 2, missing: null },
+    ], ['key', 'value', 'missing'])
+    const proposal = (id: string, kind: CleaningRule['kind'], columns: string[]): PlannedRule => ({
+      rule: { id, kind, enabled: false, risk: 'high', scope: { mode: 'all' }, options: {} },
+      columns, columnIds: columns.map((name) => profile.columns.find((column) => column.name === name)!.id), proposed: true, status: 'pending', reason: 'Issue found',
+    })
+    const fill = proposal('fill-missing', 'fill-missing', ['missing'])
+    const duplicates = proposal('remove-duplicates', 'remove-duplicates', ['key', 'value'])
+    expect(profile.summary.fullyDuplicateRows).toBe(2)
+    expect(rankRiskyProposals([fill, duplicates], profile).map((item) => item.rule.id)).toEqual(['remove-duplicates', 'fill-missing'])
+    expect(rankRiskyProposals([fill, duplicates], profile)).toEqual(rankRiskyProposals([fill, duplicates], profile))
+  })
+
   it('blocks automatic row or column removal that exceeds the safety bounds', () => {
     const rows = [{ Name: 'valid', Empty: null }, { Name: 'also valid', Empty: null }, { Name: null, Empty: null }, { Name: 'N/A', Empty: null }, { Name: '', Empty: null }]
     const emptyProfile = buildProfile(rows, ['Name', 'Empty'])
@@ -136,6 +230,36 @@ describe('Smart Clean', () => {
     const protectedResult = runSmartClean(allEmpty, buildProfile(allEmpty, ['left', 'right']))
     expect(protectedResult.rows).toHaveLength(2)
     expect(protectedResult.groups.find((group) => group.ruleId === 'remove-empty-columns')?.warning).toMatch(/leave no columns/)
+  })
+
+  it('normalizes evidenced date values, flags impossible dates, and leaves ambiguous dates for one pending decision', () => {
+    const rows: DataRow[] = [{ Order_Date: '20-03-2026' }, { Order_Date: '04/05/2026' }, { Order_Date: '31-02-2026' }, { Order_Date: '03/04/2026' }]
+    const result = runSmartClean(rows, buildProfile(rows, ['Order_Date']))
+    expect(result.rows.map((row) => row.order_date)).toEqual(['2026-03-20', '2026-05-04', null, '2026-04-03'])
+    const dateGroup = result.groups.find((group) => group.ruleId === 'normalize-dates')!
+    expect(dateGroup.cellsChanged).toBe(4)
+    expect(dateGroup.cellsFlagged).toBe(1)
+    expect(dateGroup.samples.some((sample) => sample.includes('31-02-2026'))).toBe(true)
+    expect(dateGroup.samples.some((sample) => sample.includes('2 text dates have day > 12'))).toBe(true)
+    expect(result.proposed.some((proposal) => proposal.rule.kind === 'resolve-ambiguous-dates')).toBe(false)
+
+    const noEvidence: DataRow[] = [{ Order_Date: '03/04/2026' }, { Order_Date: '10-11-2026' }]
+    const ambiguous = runSmartClean(noEvidence, buildProfile(noEvidence, ['Order_Date']))
+    const proposal = ambiguous.proposed.find((item) => item.rule.kind === 'resolve-ambiguous-dates')
+    expect(proposal?.status).toBe('pending')
+    expect(ambiguous.rows.map((row) => row.order_date)).toEqual(['03/04/2026', '10-11-2026'])
+  })
+
+  it('proposes Excel month/day swaps only from day-first evidence and applies them only after accept', () => {
+    const rows: DataRow[] = [{ Order_Date: '2026-03-04', Order_ID: 'A' }, { Order_Date: '2026-03-03', Order_ID: 'B' }, { Order_Date: '20-03-2026', Order_ID: 'C' }]
+    const cleaned = runSmartClean(rows, buildProfile(rows, ['Order_Date', 'Order_ID']), [], undefined, undefined, { Order_Date: [0, 1] })
+    expect(cleaned.rows.map((row) => row.order_date)).toEqual(['2026-03-04', '2026-03-03', '2026-03-20'])
+    const proposal = cleaned.proposed.find((item) => item.rule.kind === 'swap-excel-date-components')!
+    expect(proposal.status).toBe('pending')
+    expect(proposal.rule.options.evidence).toContain('day/month')
+    const decision = executeRiskyDecision(cleaned.rows, { kind: 'swap-excel-date-components', columns: proposal.columns, options: { rowSignatures: JSON.parse(String(proposal.rule.options.rowSignatures)) as string[] } })
+    expect(decision.result.cellsChanged).toBe(1)
+    expect(decision.rows.map((row) => row.order_date)).toEqual(['2026-04-03', '2026-03-03', '2026-03-20'])
   })
 
   it('never removes a non-empty row across seeded random messy inputs', () => {

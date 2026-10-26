@@ -1,13 +1,13 @@
 import type { ChangeStep, DataRow, DataValue, RiskyDecision, RiskyDryRun } from '../types'
+import { swapDateMonthAndDay } from '../cleaners/dateNormalization'
+import { parseFormattedNumber } from '../cleaners/rules'
 
 const missing = (value: DataValue): boolean => value == null || typeof value === 'string' && ['', 'n/a', 'na', '-', 'null', 'none'].includes(value.trim().toLowerCase())
 const numeric = (value: DataValue): number | null => {
   if (typeof value === 'number') return Number.isFinite(value) ? value : null
   if (typeof value !== 'string') return null
-  const normalized = value.trim().replace(/[$£€¥,\s]/g, '')
-  if (!/^-?(?:\d+\.?\d*|\.\d+)$/.test(normalized)) return null
-  const result = Number(normalized)
-  return Number.isFinite(result) ? result : null
+  const parsed = parseFormattedNumber(value)
+  return typeof parsed === 'number' && Number.isFinite(parsed) ? parsed : null
 }
 const median = (values: number[]): number => {
   const sorted = [...values].sort((a, b) => a - b)
@@ -55,29 +55,66 @@ function changedSamples(rows: DataRow[], next: DataRow[]): Array<{ before: DataR
   return samples
 }
 
-export function executeRiskyDecision(rows: DataRow[], decision: RiskyDecision, protectedColumns: string[] = [], dryRun = false): { result: RiskyDryRun; rows: DataRow[] } {
+export function executeRiskyDecision(rows: DataRow[], decision: RiskyDecision, protectedColumns: string[] = [], dryRun = false, rowOrderKey?: string): { result: RiskyDryRun; rows: DataRow[] } {
   const columns = getColumns(decision, protectedColumns)
   let next = rows.map((row) => ({ ...row }))
   let rowsRemoved = 0
+  let removedRowIds: number[] = []
   let cellsChanged = 0
+  let cellsEstimated = 0
   let flaggedCells = 0
+  let validationSamples: Array<{ before: DataRow; after: DataRow }> = []
   const action = getString(decision, 'action', decision.kind === 'handle-outliers' ? 'flag' : '')
 
   if (decision.kind === 'remove-duplicates') {
     const keysOption = decision.options.keys
-    const keys = Array.isArray(keysOption) && keysOption.length ? keysOption as string[] : Object.keys(rows[0] ?? {})
+    const keys = Array.isArray(keysOption) && keysOption.length ? keysOption as string[] : Object.keys(rows[0] ?? {}).filter((name) => name !== rowOrderKey)
     const keep = getString(decision, 'keep', 'first')
     const keyed = rows.map((row, index) => ({ row: { ...row }, index, key: JSON.stringify(keys.map((column) => row[column] ?? null)) }))
     const seen = new Set<string>()
     const filtered = keep === 'last' ? [...keyed].reverse().filter((item) => { if (seen.has(item.key)) return false; seen.add(item.key); return true }).reverse() : keyed.filter((item) => { if (seen.has(item.key)) return false; seen.add(item.key); return true })
     rowsRemoved = rows.length - filtered.length
+    const retained = new Set(filtered.map((item) => item.index))
+    removedRowIds = keyed.filter((item) => !retained.has(item.index)).map((item) => typeof item.row[rowOrderKey ?? ''] === 'number' ? item.row[rowOrderKey!] as number : item.index)
     next = filtered.map((item) => item.row)
   } else if (decision.kind === 'fill-missing') {
     const strategy = getString(decision, 'strategy', 'mode')
+    const groupBy = getString(decision, 'groupBy', '')
+    if (strategy === 'forward-fill' && decision.options.orderedRows !== true) throw new Error('Forward fill requires confirmation that rows are ordered by time or sequence.')
     const value = decision.options.value as DataValue
     if (strategy === 'drop-rows') {
-      next = rows.filter((row) => !columns.some((column) => missing(row[column])))
+      const keep = rows.map((row) => !columns.some((column) => missing(row[column])))
+      removedRowIds = keep.flatMap((retained, index) => !retained ? [typeof rows[index]?.[rowOrderKey ?? ''] === 'number' ? rows[index]![rowOrderKey!] as number : index] : [])
+      next = rows.filter((_, index) => keep[index])
       rowsRemoved = rows.length - next.length
+    } else if (strategy === 'model-estimates') {
+      const rawEstimates = getString(decision, 'estimatedValues', '{}')
+      const parsedEstimates = JSON.parse(rawEstimates) as Record<string, Array<{ rowIndex: number; value: DataValue; uncertainty?: number }>>
+      const estimatesByColumn = new Map(Object.entries(parsedEstimates).map(([column, values]) => [column, new Map(values.map((estimate) => [estimate.rowIndex, estimate]))]))
+      for (const column of columns) {
+        const estimates = estimatesByColumn.get(column)
+        if (!estimates) continue
+        const observed = rows.map((row) => numeric(row[column])).filter((item): item is number => item !== null)
+        const minimum = observed.length ? observed.reduce((current, value) => Math.min(current, value), Number.POSITIVE_INFINITY) : Number.NEGATIVE_INFINITY
+        const maximum = observed.length ? observed.reduce((current, value) => Math.max(current, value), Number.NEGATIVE_INFINITY) : Number.POSITIVE_INFINITY
+        const integerTarget = decision.options.targetType === 'integer'
+        const nonNegativeTarget = decision.options.nonNegative === true || observed.length > 0 && minimum >= 0
+        next = next.map((row, rowIndex) => {
+          const estimate = estimates.get(rowIndex)
+          if (!estimate || !missing(row[column]) || estimate.value === null || typeof estimate.value === 'string' && missing(estimate.value)) return row
+          let replacement = estimate.value
+          if (typeof replacement === 'number') {
+            if (!Number.isFinite(replacement)) return row
+            replacement = Math.max(minimum, Math.min(maximum, replacement))
+            if (integerTarget) replacement = Math.round(replacement)
+            if (nonNegativeTarget) replacement = Math.max(0, replacement)
+          }
+          const changed = { ...row, [column]: replacement }
+          cellsChanged++
+          cellsEstimated++
+          return changed
+        })
+      }
     } else if (strategy !== 'leave-null') {
       const stats = new Map<string, DataValue>()
       for (const column of columns) {
@@ -87,12 +124,39 @@ export function executeRiskyDecision(rows: DataRow[], decision: RiskyDecision, p
         else if (strategy === 'median') { const nums = values.map(numeric).filter((item): item is number => item !== null); if (nums.length) stats.set(column, median(nums)) }
         else if (strategy === 'mode') stats.set(column, mode(values))
       }
+      const groupedStats = new Map<string, Map<string, DataValue>>()
+      if ((strategy === 'group-median' || strategy === 'group-mode') && groupBy && rows.some((row) => Object.hasOwn(row, groupBy))) {
+        const grouped = new Map<string, DataRow[]>()
+        for (const row of rows) {
+          const key = JSON.stringify(row[groupBy] ?? null)
+          const groupRows = grouped.get(key) ?? []
+          groupRows.push(row)
+          grouped.set(key, groupRows)
+        }
+        for (const [groupKey, groupRows] of grouped) {
+          const byColumn = new Map<string, DataValue>()
+          for (const column of columns) {
+            if (column === groupBy) continue
+            const present = groupRows.map((row) => row[column]).filter((item) => !missing(item))
+            if (strategy === 'group-mode') {
+              const replacement = mode(present)
+              if (replacement !== null) byColumn.set(column, replacement)
+            } else {
+              const numbers = present.map(numeric).filter((item): item is number => item !== null)
+              if (numbers.length) byColumn.set(column, median(numbers))
+            }
+          }
+          groupedStats.set(groupKey, byColumn)
+        }
+      }
       const carried = new Map<string, DataValue>()
       next = rows.map((row) => {
         const changed = { ...row }
         for (const column of columns) {
           if (!missing(row[column])) { carried.set(column, row[column] ?? null); continue }
-          const replacement = strategy === 'forward-fill' ? carried.get(column) : stats.get(column)
+          const replacement = strategy === 'forward-fill' ? carried.get(column)
+            : strategy === 'group-median' || strategy === 'group-mode' ? groupedStats.get(JSON.stringify(row[groupBy] ?? null))?.get(column)
+              : stats.get(column)
           if (replacement !== undefined && replacement !== null) { changed[column] = replacement; cellsChanged++ }
         }
         return changed
@@ -124,6 +188,7 @@ export function executeRiskyDecision(rows: DataRow[], decision: RiskyDecision, p
     }
     flaggedCells = rows.reduce((sum, row) => sum + columns.filter((column) => { const number = numeric(row[column]); const bound = bounds.get(column); return number !== null && bound !== undefined && (number < bound.low || number > bound.high) }).length, 0)
     if (actionKind === 'remove') {
+      removedRowIds = [...outlierRows].map((index) => typeof rows[index]?.[rowOrderKey ?? ''] === 'number' ? rows[index]![rowOrderKey!] as number : index)
       next = rows.filter((_, index) => !outlierRows.has(index)); rowsRemoved = rows.length - next.length
     } else if (actionKind === 'cap') {
       next = rows.map((row) => {
@@ -135,6 +200,22 @@ export function executeRiskyDecision(rows: DataRow[], decision: RiskyDecision, p
         return changed
       })
     }
+  } else if (decision.kind === 'resolve-validation') {
+    const selectedAction = getString(decision, 'action', 'leave')
+    const flaggedIndices: number[] = []
+    next = rows.map((row, rowIndex) => {
+      const changed = { ...row }
+      for (const column of columns) {
+        const number = numeric(row[column] ?? null)
+        if (number === null || number >= 0) continue
+        flaggedCells += 1
+        if (flaggedIndices.length < 10 && !flaggedIndices.includes(rowIndex)) flaggedIndices.push(rowIndex)
+        if (selectedAction === 'empty') { changed[column] = null; cellsChanged += 1 }
+        else if (selectedAction === 'absolute') { changed[column] = Math.abs(number); cellsChanged += 1 }
+      }
+      return changed
+    })
+    validationSamples = flaggedIndices.map((rowIndex) => ({ before: { ...rows[rowIndex]! }, after: { ...next[rowIndex]! } }))
   } else if (decision.kind === 'standardize-categories') {
     const raw = getString(decision, 'mapping', '{}')
     const mapping = JSON.parse(raw) as Record<string, string>
@@ -175,9 +256,23 @@ export function executeRiskyDecision(rows: DataRow[], decision: RiskyDecision, p
       }
       return changed
     })
+  } else if (decision.kind === 'swap-excel-date-components') {
+    const signaturesOption = decision.options.rowSignatures
+    const signatures = new Set(Array.isArray(signaturesOption) ? signaturesOption : [])
+    next = rows.map((row) => {
+      const changed = { ...row }
+      for (const column of columns) {
+        if (!signatures.has(JSON.stringify({ column, row }))) continue
+        const current = row[column]
+        if (typeof current !== 'string') continue
+        const swapped = swapDateMonthAndDay(current)
+        if (swapped && swapped !== current) { changed[column] = swapped; cellsChanged++ }
+      }
+      return changed
+    })
   }
 
-  const samples = changedSamples(rows, next)
+  const samples = validationSamples.length ? validationSamples : changedSamples(rows, next)
   if (decision.kind === 'handle-outliers' && action === 'flag' && !samples.length) {
     const sampleBounds = new Map<string, { low: number; high: number }>()
     for (const column of columns) {
@@ -198,10 +293,29 @@ export function executeRiskyDecision(rows: DataRow[], decision: RiskyDecision, p
       if (isOutlier) samples.push({ before: { ...row }, after: { ...row } })
     }
   }
-  const result: RiskyDryRun = { decision, rowsBefore: rows.length, rowsAfter: next.length, rowsRemoved, cellsChanged, flaggedCells, samples }
+  const result: RiskyDryRun = { decision, rowsBefore: rows.length, rowsAfter: next.length, rowsRemoved, ...(removedRowIds.length ? { removedRowIds } : {}), cellsChanged, cellsEstimated, flaggedCells, samples }
   return { result, rows: dryRun ? rows : next }
 }
 
 export function makeChangeStep(dryRun: RiskyDryRun): ChangeStep {
-  return { id: crypto.randomUUID(), label: dryRun.decision.kind, ruleId: dryRun.decision.kind, scope: { mode: 'explicit', include: [...dryRun.decision.columns] }, timestamp: new Date().toISOString(), rowsBefore: dryRun.rowsBefore, rowsAfter: dryRun.rowsAfter, rowsRemoved: dryRun.rowsRemoved, cellsChanged: dryRun.cellsChanged, columnsRenamed: 0, flaggedCells: dryRun.flaggedCells, samples: dryRun.samples, undone: false }
+  const model = typeof dryRun.decision.options.model === 'string' ? dryRun.decision.options.model : undefined
+  let validationSummary = ''
+  let uncertaintyKind: 'numeric' | 'categorical' = 'numeric'
+  let validationDetails: Record<string, string> | undefined
+  if (model && typeof dryRun.decision.options.validation === 'string') {
+    try {
+      const validation = JSON.parse(dryRun.decision.options.validation) as Record<string, unknown>
+      if (validation.kind === 'numeric') validationSummary = ` · MAE ${Number(validation.modelMae).toFixed(3)} / MAPE ${validation.modelMape == null ? 'n/a' : `${Number(validation.modelMape).toFixed(2)}%`}`
+      else if (validation.kind === 'categorical') { uncertaintyKind = 'categorical'; validationSummary = ` · accuracy ${(Number(validation.modelAccuracy) * 100).toFixed(1)}%` }
+      validationDetails = Object.fromEntries(dryRun.decision.columns.map((column) => [column, `${model}${validationSummary}`]))
+    } catch { validationSummary = '' }
+  }
+  let estimateUncertaintyByColumn: Record<string, Record<string, { value: number; kind: 'numeric' | 'categorical' }>> | undefined
+  if (dryRun.cellsEstimated && typeof dryRun.decision.options.estimatedValues === 'string') {
+    try {
+      const values = JSON.parse(dryRun.decision.options.estimatedValues) as Record<string, Array<{ rowIndex: number; uncertainty?: number }>>
+      estimateUncertaintyByColumn = Object.fromEntries(Object.entries(values).map(([column, estimates]) => [column, Object.fromEntries(estimates.filter((item) => Number.isInteger(item.rowIndex) && typeof item.uncertainty === 'number' && Number.isFinite(item.uncertainty)).map((item) => [String(item.rowIndex), { value: item.uncertainty!, kind: uncertaintyKind }]))]))
+    } catch { estimateUncertaintyByColumn = undefined }
+  }
+  return { id: crypto.randomUUID(), label: model ? `${dryRun.decision.kind} · ${model}${validationSummary}` : dryRun.decision.kind, ruleId: dryRun.decision.kind, scope: { mode: 'explicit', include: [...dryRun.decision.columns] }, timestamp: new Date().toISOString(), rowsBefore: dryRun.rowsBefore, rowsAfter: dryRun.rowsAfter, rowsRemoved: dryRun.rowsRemoved, ...(dryRun.removedRowIds?.length ? { removedRowIds: dryRun.removedRowIds } : {}), cellsChanged: dryRun.cellsChanged, cellsEstimated: dryRun.cellsEstimated ?? 0, ...(validationDetails ? { estimateDetailsByColumn: validationDetails } : {}), ...(estimateUncertaintyByColumn ? { estimateUncertaintyByColumn } : {}), columnsRenamed: 0, flaggedCells: dryRun.flaggedCells, samples: dryRun.samples, undone: false }
 }
