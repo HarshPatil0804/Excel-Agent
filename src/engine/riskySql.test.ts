@@ -25,6 +25,16 @@ describe('DuckDB risky SQL plans', () => {
     if (strategy === 'forward-fill') expect(sql).toContain('IGNORE NULLS')
   })
 
+  it('derives a missing product from two operand columns instead of a median fallback', () => {
+    const sql = buildRiskySelect({ kind: 'fill-missing', columns: ['b'], options: { strategy: 'exact-derivation', formulaLeft: 'a', formulaRight: '名前' } }, ['a', 'b', '名前'], [], 'source_version')
+    expect(sql).toContain('CASE WHEN')
+    expect(sql).toContain('* ')
+    expect(sql).toContain('"a"')
+    expect(sql).toContain('"名前"')
+    expect(sql).not.toContain('MEDIAN(TRY_CAST')
+    expect(() => buildRiskySelect({ kind: 'fill-missing', columns: ['b'], options: { strategy: 'exact-derivation', formulaLeft: 'a' } }, ['a', 'b'], [], 'source_version')).toThrow(/operand columns/i)
+  })
+
   it('blocks forward fill SQL unless row ordering is explicitly confirmed', () => {
     expect(() => build('fill-missing', { strategy: 'forward-fill' })).toThrow(/ordered by time/i)
   })

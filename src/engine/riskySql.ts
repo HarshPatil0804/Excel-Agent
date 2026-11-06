@@ -4,6 +4,16 @@ export const quoteSqlIdentifier = (name: string): string => `"${name.replaceAll(
 export const quoteSqlString = (value: string): string => `'${value.replaceAll("'", "''")}'`
 const isMissing = (column: string): string => `(${column} IS NULL OR TRIM(CAST(${column} AS VARCHAR)) = '' OR LOWER(TRIM(CAST(${column} AS VARCHAR))) IN ('n/a','na','null','none','-'))`
 
+/** Numeric value of a possibly formatted cell; NULL when the text is not a supported number. */
+const sqlNumericValue = (name: string): string => {
+  const column = quoteSqlIdentifier(name)
+  const text = `TRIM(CAST(${column} AS VARCHAR))`
+  const stripped = `REGEXP_REPLACE(REGEXP_REPLACE(${text}, '[%()]', '', 'g'), '^(INR|USD|EUR|GBP|[$£€¥₹])\\s*|\\s*(INR|USD|EUR|GBP)$', '', 'gi')`
+  const european = `(REGEXP_FULL_MATCH(${stripped}, '[0-9]{1,3}(\\.[0-9]{3})+,[0-9]{1,2}') OR REGEXP_FULL_MATCH(${stripped}, '[0-9]+,[0-9]{1,2}'))`
+  const normalized = `CASE WHEN ${european} THEN REPLACE(REPLACE(${stripped}, '.', ''), ',', '.') ELSE REPLACE(${stripped}, ',', '') END`
+  return `(TRY_CAST(${normalized} AS DOUBLE) * CASE WHEN LEFT(${text}, 1) = '(' THEN -1 ELSE 1 END / CASE WHEN RIGHT(${text}, 1) = '%' THEN 100 ELSE 1 END)`
+}
+
 /** Builds a SELECT over the current DuckDB relation. __dc_order is retained for stable first/last and replay ordering. */
 export function buildRiskySelect(decision: RiskyDecision, columns: string[], protectedColumns: string[], source = 'dataset'): string {
   const selected = decision.columns.filter((name) => columns.includes(name) && !protectedColumns.includes(name))
@@ -25,6 +35,18 @@ export function buildRiskySelect(decision: RiskyDecision, columns: string[], pro
     if (strategy === 'drop-rows') {
       const predicate = selected.map((name) => isMissing(quoteSqlIdentifier(name))).join(' OR ')
       where = predicate ? ` WHERE NOT (${predicate})` : ''
+    } else if (strategy === 'exact-derivation') {
+      const left = typeof decision.options.formulaLeft === 'string' ? decision.options.formulaLeft : ''
+      const right = typeof decision.options.formulaRight === 'string' ? decision.options.formulaRight : ''
+      if (!left || !right || left === right) throw new Error('Exact derivation requires two different operand columns.')
+      const leftValue = sqlNumericValue(left)
+      const rightValue = sqlNumericValue(right)
+      projection = refs.map((column) => {
+        const name = column.slice(1, -1).replaceAll('""', '"')
+        if (!selected.includes(name) || name === left || name === right) return column
+        const derived = `CAST((${leftValue}) * (${rightValue}) AS VARCHAR)`
+        return `CASE WHEN ${isMissing(column)} AND (${leftValue}) IS NOT NULL AND (${rightValue}) IS NOT NULL THEN ${derived} ELSE CAST(${column} AS VARCHAR) END AS ${column}`
+      }).join(', ')
     } else {
       projection = refs.map((column) => {
         if (!selected.includes(column.slice(1, -1).replaceAll('""', '"'))) return column

@@ -465,6 +465,27 @@ describe('in-memory and DuckDB risky rule parity', () => {
     }
   }, 30_000)
 
+  it('derives exact products from two operands identically in memory and DuckDB', () => {
+    const columns = ['quantity', 'unit_price', 'revenue']
+    const rows: DataRow[] = [
+      { quantity: 2, unit_price: 3, revenue: 6 },
+      { quantity: 4, unit_price: 2.5, revenue: null },
+      { quantity: 'N/A', unit_price: 7, revenue: null },
+      { quantity: 3, unit_price: 4, revenue: 12 },
+    ]
+    connection.query('DROP TABLE IF EXISTS derivation_source')
+    connection.query('CREATE TABLE derivation_source ("quantity" VARCHAR, "unit_price" VARCHAR, "revenue" VARCHAR, "__dc_order" BIGINT)')
+    connection.query(`INSERT INTO derivation_source VALUES ${rows.map((row, index) => `(${columns.map((name) => quote(row[name])).concat(String(index)).join(', ')})`).join(', ')}`)
+    const decision: RiskyDecision = { kind: 'fill-missing', columns: ['revenue'], options: { strategy: 'exact-derivation', formulaLeft: 'quantity', formulaRight: 'unit_price' } }
+    const sql = buildRiskySelect(decision, columns, [], 'derivation_source')
+    const duckRows = connection.query(sql).toArray().map((row) => cleanOrder(row.toJSON() as OrderedRow))
+    const inMemory = executeRiskyDecision(rows, decision)
+    expect(canonicalRows(duckRows)).toEqual(canonicalRows(inMemory.rows))
+    expect(inMemory.result.cellsChanged).toBe(1)
+    expect(duckRows.find((row) => row.revenue != null && canonical(row.revenue) === 10)).toBeDefined()
+    connection.query('DROP TABLE derivation_source')
+  })
+
   it('builds a dataset-wide query for 1,000 columns without per-column request generation', () => {
     const columns = Array.from({ length: 1000 }, (_, index) => `column_${index}`)
     const sql = buildRiskySelect({ kind: 'fill-missing', columns, options: { strategy: 'constant', value: 'x' } }, columns, ['column_999'], 'source_version')

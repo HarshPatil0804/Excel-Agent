@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { detectProductDerivations } from './exactDerivation'
-import { executeRiskyDecision } from './riskyDecisions'
+import { executeRiskyDecision, makeChangeStep } from './riskyDecisions'
 import type { DataRow, RiskyDecision } from '../types'
 
 const makeRows = (): DataRow[] => Array.from({ length: 240 }, (_, index) => ({
@@ -14,7 +14,7 @@ describe('user-confirmed exact product derivation', () => {
     const rows = makeRows()
     const [suggestion] = detectProductDerivations(rows, ['Revenue'], Object.keys(rows[0]!))
     expect(suggestion).toMatchObject({ target: 'Revenue', left: 'Quantity', right: 'Unit Price', observedRows: 213, fillableRows: 27, matchPercent: 100 })
-    expect(suggestion?.samples[0]).toMatchObject({ before: null, after: 24 })
+    expect(suggestion?.samples[0]).toMatchObject({ before: null, after: 1 * 2 })
   })
 
   it('does not suggest a formula when observed values contradict the relation', () => {
@@ -30,9 +30,13 @@ describe('user-confirmed exact product derivation', () => {
     expect(preview.result).toMatchObject({ rowsRemoved: 0, cellsChanged: 27 })
     expect(preview.result.samples).toHaveLength(10)
     expect(preview.rows).toEqual(rows)
+    const step = makeChangeStep(preview.result)
+    expect(step.label).toContain('exact derivation')
+    expect(step.cellsEstimated ?? 0).toBe(0)
+    expect(step.estimateDetailsByColumn).toBeUndefined()
     const applied = executeRiskyDecision(rows, decision)
-    expect(applied.rows.every((row, index) => row.Revenue === null || row.Revenue === rows[index]!.Revenue)).toBe(true)
+    expect(applied.rows.every((row, index) => rows[index]!.Revenue === null || row.Revenue === rows[index]!.Revenue)).toBe(true)
     expect(applied.rows.filter((row) => row.Revenue === null)).toHaveLength(0)
-    expect(applied.rows[0]?.Revenue).toBe(2 * 2)
+    expect(applied.rows[0]?.Revenue).toBe(1 * 2)
   })
 })

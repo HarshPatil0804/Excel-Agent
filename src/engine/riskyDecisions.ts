@@ -1,6 +1,7 @@
 import type { ChangeStep, DataRow, DataValue, RiskyDecision, RiskyDryRun } from '../types'
 import { swapDateMonthAndDay } from '../cleaners/dateNormalization'
 import { parseFormattedNumber } from '../cleaners/rules'
+import { applyProductDerivation } from './exactDerivation'
 
 const missing = (value: DataValue): boolean => value == null || typeof value === 'string' && ['', 'n/a', 'na', '-', 'null', 'none'].includes(value.trim().toLowerCase())
 const numeric = (value: DataValue): number | null => {
@@ -87,6 +88,18 @@ export function executeRiskyDecision(rows: DataRow[], decision: RiskyDecision, p
       removedRowIds = keep.flatMap((retained, index) => !retained ? [typeof rows[index]?.[rowOrderKey ?? ''] === 'number' ? rows[index]![rowOrderKey!] as number : index] : [])
       next = rows.filter((_, index) => keep[index])
       rowsRemoved = rows.length - next.length
+    } else if (strategy === 'exact-derivation') {
+      const left = getString(decision, 'formulaLeft', '')
+      const right = getString(decision, 'formulaRight', '')
+      if (!left || !right || left === right) throw new Error('Exact derivation requires two different operand columns.')
+      const targets = columns.filter((column) => column !== left && column !== right)
+      let derivedRows = next
+      for (const column of targets) {
+        const derived = applyProductDerivation(derivedRows, column, left, right)
+        derivedRows = derived.rows
+        cellsChanged += derived.cellsChanged
+      }
+      next = derivedRows
     } else if (strategy === 'model-estimates') {
       const rawEstimates = getString(decision, 'estimatedValues', '{}')
       const parsedEstimates = JSON.parse(rawEstimates) as Record<string, Array<{ rowIndex: number; value: DataValue; uncertainty?: number }>>
@@ -299,6 +312,8 @@ export function executeRiskyDecision(rows: DataRow[], decision: RiskyDecision, p
 
 export function makeChangeStep(dryRun: RiskyDryRun): ChangeStep {
   const model = typeof dryRun.decision.options.model === 'string' ? dryRun.decision.options.model : undefined
+  const derivedFormula = dryRun.decision.options.strategy === 'exact-derivation' && typeof dryRun.decision.options.formulaLeft === 'string' && typeof dryRun.decision.options.formulaRight === 'string'
+    ? `${dryRun.decision.options.formulaLeft} × ${dryRun.decision.options.formulaRight}` : undefined
   let validationSummary = ''
   let uncertaintyKind: 'numeric' | 'categorical' = 'numeric'
   let validationDetails: Record<string, string> | undefined
@@ -317,5 +332,5 @@ export function makeChangeStep(dryRun: RiskyDryRun): ChangeStep {
       estimateUncertaintyByColumn = Object.fromEntries(Object.entries(values).map(([column, estimates]) => [column, Object.fromEntries(estimates.filter((item) => Number.isInteger(item.rowIndex) && typeof item.uncertainty === 'number' && Number.isFinite(item.uncertainty)).map((item) => [String(item.rowIndex), { value: item.uncertainty!, kind: uncertaintyKind }]))]))
     } catch { estimateUncertaintyByColumn = undefined }
   }
-  return { id: crypto.randomUUID(), label: model ? `${dryRun.decision.kind} · ${model}${validationSummary}` : dryRun.decision.kind, ruleId: dryRun.decision.kind, scope: { mode: 'explicit', include: [...dryRun.decision.columns] }, timestamp: new Date().toISOString(), rowsBefore: dryRun.rowsBefore, rowsAfter: dryRun.rowsAfter, rowsRemoved: dryRun.rowsRemoved, ...(dryRun.removedRowIds?.length ? { removedRowIds: dryRun.removedRowIds } : {}), cellsChanged: dryRun.cellsChanged, cellsEstimated: dryRun.cellsEstimated ?? 0, ...(validationDetails ? { estimateDetailsByColumn: validationDetails } : {}), ...(estimateUncertaintyByColumn ? { estimateUncertaintyByColumn } : {}), columnsRenamed: 0, flaggedCells: dryRun.flaggedCells, samples: dryRun.samples, undone: false }
+  return { id: crypto.randomUUID(), label: derivedFormula ? `${dryRun.decision.kind} · exact derivation ${derivedFormula}` : model ? `${dryRun.decision.kind} · ${model}${validationSummary}` : dryRun.decision.kind, ruleId: dryRun.decision.kind, scope: { mode: 'explicit', include: [...dryRun.decision.columns] }, timestamp: new Date().toISOString(), rowsBefore: dryRun.rowsBefore, rowsAfter: dryRun.rowsAfter, rowsRemoved: dryRun.rowsRemoved, ...(dryRun.removedRowIds?.length ? { removedRowIds: dryRun.removedRowIds } : {}), cellsChanged: dryRun.cellsChanged, cellsEstimated: dryRun.cellsEstimated ?? 0, ...(validationDetails ? { estimateDetailsByColumn: validationDetails } : {}), ...(estimateUncertaintyByColumn ? { estimateUncertaintyByColumn } : {}), columnsRenamed: 0, flaggedCells: dryRun.flaggedCells, samples: dryRun.samples, undone: false }
 }

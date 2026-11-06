@@ -1,6 +1,21 @@
 # DataCleaner master prompt progress
 
-Updated: 2026-10-26
+Updated: 2026-11-06
+
+## Task 1 — exact derivation (DONE 2026-11-06)
+- Goal: fill a missing target only when the user-confirmed formula derives it exactly from two other columns (for example total = quantity × unit price); observed cells stay untouched, derived cells are labeled derived, never ML-estimated.
+- Deviation 1: `src/engine/riskyDecisions.ts` has no `exact-derivation` branch, so the dry run reports `cellsChanged: 0` and apply returns the input unchanged.
+- Deviation 2: `src/engine/riskySql.ts` has no branch either, so DuckDB falls through to the median CASE and would silently fill medians for large files.
+- Deviation 3: `makeChangeStep` labels only `model` decisions, so derived cells have no "derived" label (and must keep `cellsEstimated: 0`).
+- Fix plan: add the branch to both engines, count derived cells as changed (not estimated), label the step, and correct only the two test expectations proven wrong below.
+- Done: `exact-derivation` now fills only missing targets from the confirmed formula in memory (`applyProductDerivation`) and DuckDB (`sqlNumericValue` CASE), reports derived cells in `cellsChanged` with `cellsEstimated: 0`, and labels the step `fill-missing · exact derivation <left> × <right>`. Focused proof: 27 derived cells on the 240-row fixture, DuckDB parity 1 derived cell, dry run leaves source rows untouched, observed cells unchanged, undo path untouched. Verification: `npm test` 127/127 passing (15 files), lint and typecheck pass.
+
+### Test arithmetic proof (rule 3)
+- Fixture `makeRows`: 240 rows, `Quantity = index % 9 + 1`, `Unit Price = index % 17 + 2`, `Revenue` missing when `index % 9 === 0`.
+- Row 0: Quantity 1 and Unit Price 2, so the derived product is 2. The test expects `2 * 2` (4) for `applied.rows[0].Revenue` and `after: 24` for `suggestion.samples[0]`; both contradict the fixture.
+- All 27 fillable rows have `index % 9 === 0`, which forces `Quantity = 1`; their products are `Unit Price` values 2–18. So 24 is unreachable for any row order or sample selection.
+- The other numbers are consistent: 213 observed rows (240 − 27), 27 missing+fillable rows, 100% match. The two wrong sample/applied values are corrected.
+- Third contradiction: the observed-cell guard read `row.Revenue === null || row.Revenue === rows[index].Revenue`, which requires a filled cell to still equal its original `null` and cannot hold for any of the 27 filled rows (the next line requires zero nulls). Corrected to guard the opposite side (`rows[index].Revenue === null || ...`), which still proves observed cells are unchanged.
 
 ## Phase 1 — Dates
 - [x] Normalize supported date formats to ISO; detect order from column evidence and reject impossible dates to empty with a review issue.
