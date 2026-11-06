@@ -1,10 +1,10 @@
 import type { CleaningGroup, CleaningRecipe, CleaningRule, ColumnProfile, DataRow, PlannedRule, ProfileResult, RecipeMatchReport, SmartCleanResult } from '../types'
-import { buildCategoryMapping, formattedNumberParseRate, isEmptyValue, isRuleApplicable, normalizeColumnName, parseFormattedNumber, transformRow } from '../cleaners/rules'
+import { buildCategoryMapping, currencySignature, formattedNumberParseRate, isEmptyValue, isRuleApplicable, normalizeColumnName, parseFormattedNumber, repairMojibake, transformRow, transformValue } from '../cleaners/rules'
 import { findExcelDateSwapRows, normalizeDateColumn } from '../cleaners/dateNormalization'
 
 export const LOW_RISK_RULES: CleaningRule[] = [
   ...([
-    ['trim-whitespace', 'Trim whitespace'], ['normalize-missing', 'Normalize missing values'], ['formatted-numbers', 'Convert formatted numbers'], ['repair-mojibake', 'Repair mojibake'], ['canonicalize-categories', 'Canonicalize category spelling'], ['normalize-dates', 'Normalize dates'],
+    ['trim-whitespace', 'Trim whitespace'], ['normalize-missing', 'Normalize missing values'], ['repair-mojibake', 'Repair mojibake'], ['formatted-numbers', 'Convert formatted numbers'], ['canonicalize-categories', 'Canonicalize category spelling'], ['normalize-dates', 'Normalize dates'],
     ['fix-type-mismatches', 'Fix obvious type mismatches'], ['remove-empty-rows', 'Remove empty rows'], ['remove-empty-columns', 'Remove empty columns'], ['normalize-column-names', 'Normalize column names'],
   ] as const).map(([kind]) => ({ id: kind, kind, enabled: true, risk: 'low' as const, scope: { mode: 'all' as const }, options: {} })),
 ]
@@ -59,17 +59,26 @@ export function scopeMatches(rule: CleaningRule, column: ColumnProfile): boolean
 
 export function buildSmartCleanPlan(profile: ProfileResult, protectedColumns: string[] = [], rules: CleaningRule[] = [...LOW_RISK_RULES, ...RISKY_RULES], rows?: DataRow[]): PlannedRule[] {
   const protectedSet = new Set(protectedColumns)
+  // Mixed currencies may only be converted when every present cell names its currency;
+  // otherwise the raw numbers are kept and the column stays flagged for review.
+  const mixedCurrencyBlocked = (column: ColumnProfile): boolean => {
+    if (!rows || !column.issues.some((issue) => issue.code === 'mixed-currency')) return false
+    const present = rows.map((row) => repairMojibake(row[column.name] ?? null)).filter((value) => !isEmptyValue(value ?? null))
+    return !present.every((value) => currencySignature(value) !== null)
+  }
   return rules.map((sourceRule) => {
     const rule: CleaningRule = { ...sourceRule, scope: { ...sourceRule.scope }, options: { ...sourceRule.options } }
-    const applicable = profile.columns.filter((column) => !protectedSet.has(column.name) && !protectedSet.has(column.id) && scopeMatches(rule, column) && (isRuleApplicable(rule.kind, column) || (rule.kind === 'canonicalize-categories' && Boolean(rows && buildCategoryMapping(rows, column.name).size))))
+    const applicable = profile.columns.filter((column) => !protectedSet.has(column.name) && !protectedSet.has(column.id) && scopeMatches(rule, column) && (isRuleApplicable(rule.kind, column) || (rule.kind === 'canonicalize-categories' && Boolean(rows && buildCategoryMapping(rows, column.name).size))) && !(rule.kind === 'fix-type-mismatches' && mixedCurrencyBlocked(column)))
     const deferred = rule.kind === 'fill-missing' ? applicable.filter((column) => column.nullPercent > Number(rule.options.maxMissingPercent ?? 15)) : []
     const excluded = rule.kind === 'fill-missing' ? applicable.filter((column) => column.issues.some((issue) => issue.code === 'identifier-column') || column.inferredType === 'text') : []
     const selected = applicable.filter((column) => {
       if (deferred.includes(column) || excluded.includes(column) || (rule.kind === 'remove-duplicates' && profile.summary.fullyDuplicateRows === 0)) return false
       if (rule.kind === 'formatted-numbers' && rows) {
-        const values = rows.map((row) => row[column.name] ?? null)
+        // Mojibake repair runs first, so eligibility must be measured after it.
+        const values = rows.map((row) => repairMojibake(row[column.name] ?? null))
         const hasFormattedString = values.some((value) => typeof value === 'string' && typeof parseFormattedNumber(value) === 'number' && parseFormattedNumber(value) !== value)
-        return hasFormattedString && formattedNumberParseRate(values) >= 0.9
+        if (!hasFormattedString || formattedNumberParseRate(values) < 0.9) return false
+        return !mixedCurrencyBlocked(column)
       }
       return true
     })
@@ -172,6 +181,19 @@ export function runSmartClean(rows: DataRow[], profile: ProfileResult, protected
       cellsFlagged = invalidCount
       rowsRemoved = 0
       affectedRows = Math.min(affectedRows, current.length)
+    } else if (item.rule.kind === 'repair-mojibake') {
+      const next = current.map((row) => ({ ...row }))
+      for (let rowIndex = 0; rowIndex < current.length; rowIndex += 1) for (const column of item.columns) {
+        const before = current[rowIndex]?.[column] ?? null
+        const after = transformValue('repair-mojibake', before)
+        if (after === before) continue
+        next[rowIndex]![column] = after
+        cellsChanged += 1
+        changedRowIndices.add(rowIndex)
+        if (samples.length < 10) samples.push(`${column}: ${String(before)} → ${String(after)}`)
+      }
+      current = next
+      affectedRows = changedRowIndices.size
     } else if (item.rule.kind === 'normalize-column-names') {
       // Column labels are metadata. This plan step is logged here, but the actual
       // rekey happens after every data rule has finished using parse-time names.
@@ -263,6 +285,11 @@ export function runSmartClean(rows: DataRow[], profile: ProfileResult, protected
   if (highMissingColumns.length) {
     const count = highMissingColumns.reduce((sum, name) => sum + (profile.columns.find((column) => column.name === name)?.nullCount ?? 0), 0)
     groups.push({ ruleId: 'fill-missing-deferred', category: 'fill-missing', label: `${highMissingColumns.length} high-missing columns left null`, columnCount: highMissingColumns.length, columns: highMissingColumns, columnIds: highMissingColumns.map((name) => profile.columns.find((column) => column.name === name)?.id ?? `column:${name}`), affectedRows: 0, cellsChanged: 0, rowsRemoved: 0, columnsRenamed: 0, cellsFlagged: count, samples: [] })
+  }
+  const mixedCurrencyColumns = profile.columns.filter((column) => !protectedColumns.includes(column.name) && column.issues.some((issue) => issue.code === 'mixed-currency'))
+  if (mixedCurrencyColumns.length) {
+    const flagged = rows.reduce((sum, row) => sum + mixedCurrencyColumns.filter((column) => !isEmptyValue(repairMojibake(row[column.name] ?? null))).length, 0)
+    groups.push({ ruleId: 'formatted-numbers-mixed-currency', category: 'formatted-numbers', label: `${mixedCurrencyColumns.length} columns contain mixed currencies; review before combining`, columnCount: mixedCurrencyColumns.length, columns: mixedCurrencyColumns.map((column) => column.name), columnIds: mixedCurrencyColumns.map((column) => column.id), affectedRows: 0, cellsChanged: 0, rowsRemoved: 0, columnsRenamed: 0, cellsFlagged: flagged, samples: mixedCurrencyColumns.slice(0, 10).map((column) => `${column.name}: ${column.currencySymbols.join(', ') || 'multiple currencies'}`) })
   }
   const excludedFillColumns = plan.find((item) => item.rule.kind === 'fill-missing')?.excludedColumns ?? []
   if (excludedFillColumns.length) groups.push({ ruleId: 'fill-missing-excluded', category: 'fill-missing', label: `${excludedFillColumns.length} identifier/text columns excluded from autofill`, columnCount: excludedFillColumns.length, columns: excludedFillColumns, columnIds: excludedFillColumns.map((name) => profile.columns.find((column) => column.name === name)?.id ?? `column:${name}`), affectedRows: 0, cellsChanged: 0, rowsRemoved: 0, columnsRenamed: 0, cellsFlagged: 0, samples: ['Identifier and free-text columns require an explicit scope before imputation.'] })

@@ -100,6 +100,32 @@ describe('Smart Clean', () => {
     expect(result.groups.find((group) => group.ruleId === 'repair-mojibake')?.cellsChanged).toBe(1)
   })
 
+  it('repairs currency mojibake before converting formatted numbers and keeps ten samples', () => {
+    const rows: DataRow[] = Array.from({ length: 12 }, (_, index) => ({ Amount: `â‚¹${(index + 1) * 1000}` }))
+    const result = runSmartClean(rows, buildProfile(rows, ['Amount']))
+    expect(result.rows.map((row) => row.amount)).toEqual(Array.from({ length: 12 }, (_, index) => (index + 1) * 1000))
+    expect(result.rows.some((row) => String(row.amount).includes('â'))).toBe(false)
+    const repaired = result.groups.find((group) => group.ruleId === 'repair-mojibake')
+    expect(repaired?.cellsChanged).toBe(12)
+    expect(repaired?.samples).toHaveLength(10)
+    expect(result.groups.find((group) => group.ruleId === 'formatted-numbers')?.cellsChanged).toBe(12)
+  })
+
+  it('cleans an inline currency fixture to numeric revenue without mojibake or lost rows', () => {
+    const rows: DataRow[] = [
+      { 'Product Name': 'A', Revenue: 'â‚¹50,000', Quantity: '2' },
+      { 'Product Name': 'B', Revenue: 'â‚¹ 12,34,567.50', Quantity: '3' },
+      { 'Product Name': 'C', Revenue: 'N/A', Quantity: '4' },
+      { 'Product Name': 'D', Revenue: '374814 INR', Quantity: '5' },
+    ]
+    const result = runSmartClean(rows, buildProfile(rows, Object.keys(rows[0]!)))
+    const revenue = result.rows.map((row) => row.revenue)
+    expect(revenue).toEqual([50000, 1234567.5, null, 374814])
+    expect(revenue.every((value) => value == null || typeof value === 'number')).toBe(true)
+    expect(result.rows.every((row) => !String(row.revenue ?? '').includes('â'))).toBe(true)
+    expect(revenue.filter((value) => value != null).length + revenue.filter((value) => value == null).length).toBe(rows.length)
+  })
+
   it('requires a 90% parse rate before converting a mixed text column and records mixed currencies', () => {
     const lowRate: DataRow[] = [{ Revenue: '$1.00' }, { Revenue: 'not numeric' }, { Revenue: 'other text' }]
     const lowProfile = buildProfile(lowRate, ['Revenue'])
@@ -111,6 +137,11 @@ describe('Smart Clean', () => {
     expect(profile.columns[0]?.issues.some((issue) => issue.code === 'mixed-currency')).toBe(true)
     const result = runSmartClean(mixed, profile)
     expect(result.rows.map((row) => row.revenue)).toEqual([1, 2, null])
+    expect(result.groups.find((group) => group.ruleId === 'formatted-numbers-mixed-currency')).toMatchObject({ columns: ['Revenue'] })
+    const unattributed: DataRow[] = [{ Revenue: '$1.00' }, { Revenue: '€2.00' }, { Revenue: '3.00' }]
+    const unattributedResult = runSmartClean(unattributed, buildProfile(unattributed, ['Revenue']))
+    expect(unattributedResult.rows.map((row) => row.revenue)).toEqual(['$1.00', '€2.00', '3.00'])
+    expect(unattributedResult.groups.find((group) => group.ruleId === 'formatted-numbers-mixed-currency')).toMatchObject({ columns: ['Revenue'] })
   })
 
   it('canonicalizes punctuation and case using the most frequent spelling without fuzzy merging', () => {

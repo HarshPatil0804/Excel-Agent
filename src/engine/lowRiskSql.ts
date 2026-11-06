@@ -8,7 +8,7 @@ export function buildLowRiskExpression(kind: Extract<CleaningRuleKind, 'trim-whi
   if (kind === 'normalize-missing') return `CASE WHEN LOWER(TRIM(${column})) IN ('', 'n/a', 'na', 'null', 'none', '-') THEN NULL ELSE ${column} END`
   if (kind === 'formatted-numbers') {
     const text = `TRIM(CAST(${column} AS VARCHAR))`
-    const stripped = `REGEXP_REPLACE(REGEXP_REPLACE(REGEXP_REPLACE(REGEXP_REPLACE(${text}, '[%()]', '', 'g'), '^(INR|USD|EUR|GBP|[$£€¥₹])\\s*|\\s*(INR|USD|EUR|GBP)$', '', 'gi'), '^(INR|USD|EUR|GBP|[$£€¥₹])', '', 'gi'), '\\s', '', 'g')`
+    const stripped = `REGEXP_REPLACE(REGEXP_REPLACE(REGEXP_REPLACE(REGEXP_REPLACE(${text}, '[%()]', '', 'g'), '^\\(?\\s*(?:INR|USD|EUR|GBP|JPY|RS)\\.?\\s*|\\s*(?:INR|USD|EUR|GBP|JPY|RS)\\.?\\s*\\)?$', '', 'gi'), '[$£€¥₹]', '', 'g'), '\\s', '', 'g')`
     const european = `REGEXP_FULL_MATCH(${stripped}, '[0-9]{1,3}(\\.[0-9]{3})+,[0-9]{1,2}') OR REGEXP_FULL_MATCH(${stripped}, '[0-9]+,[0-9]{1,2}')`
     const normalized = `CASE WHEN ${european} THEN REPLACE(REPLACE(${stripped}, '.', ''), ',', '.') ELSE REPLACE(${stripped}, ',', '') END`
     return `CASE WHEN REGEXP_FULL_MATCH(${normalized}, '[0-9]+(\\.[0-9]+)?') AND REGEXP_MATCHES(${text}, '.*[0-9].*') THEN CAST(TRY_CAST(${normalized} AS DOUBLE) * CASE WHEN LEFT(${text}, 1) = '(' THEN -1 ELSE 1 END / CASE WHEN RIGHT(${text}, 1) = '%' THEN 100 ELSE 1 END AS VARCHAR) ELSE ${column} END`
@@ -32,7 +32,7 @@ export function buildDateNormalizationExpression(name: string, order: DateOrder)
 
 export function buildMojibakeRepairExpression(name: string): string {
   const column = quoteSqlIdentifier(name)
-  const pairs: Array<[string, string]> = [['Ã©', 'é'], ['Ã¨', 'è'], ['Ã¡', 'á'], ['Ã³', 'ó'], ['Ã±', 'ñ'], ['Ã¼', 'ü'], ['Ã§', 'ç'], ['â€™', '’'], ['â€œ', '“'], ['â€�', '”'], ['â€“', '–'], ['â€”', '—'], ['Â ', ' ']]
+  const pairs: Array<[string, string]> = [['Ã©', 'é'], ['Ã¨', 'è'], ['Ã¡', 'á'], ['Ã³', 'ó'], ['Ã±', 'ñ'], ['Ã¼', 'ü'], ['Ã§', 'ç'], ['â€™', '’'], ['â€œ', '“'], ['â€�', '”'], ['â€“', '–'], ['â€”', '—'], ['â‚¹', '₹'], ['â‚¬', '€'], ['Â ', '\u00a0']]
   let expression = `CAST(${column} AS VARCHAR)`
   for (const [bad, good] of pairs) expression = `REPLACE(${expression}, '${bad}', '${good}')`
   return `CASE WHEN REGEXP_MATCHES(CAST(${column} AS VARCHAR), '.*[ÃÂâ].*') THEN ${expression} ELSE ${column} END`

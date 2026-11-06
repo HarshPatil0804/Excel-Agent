@@ -2,6 +2,14 @@
 
 Updated: 2026-11-06
 
+## Task 2 — money, mojibake, currency text (DONE 2026-11-06, one deferral)
+- `tests/fixtures/ecommerce-practice.xlsx` is **not present**; no workbook acceptance numbers were produced. A 4-row inline fixture with the same rupee/mojibake/code patterns is used instead and is not presented as the real file.
+- `repairMojibake` now maps Windows-1252 (including 0x80-0x9F) back to bytes, decodes UTF-8 with `fatal: true`, rejects replacement characters, and accepts only when suspicious characters decrease. It runs on every column and before formatted-number conversion in memory and DuckDB.
+- `parseFormattedMoney` returns `{ numeric, currency }` (INR/USD/EUR/GBP/JPY, `Rs`/`Rs.` → INR, ₹ $ £ € ¥, Indian and European grouping, parentheses, percent, spaces); `parseFormattedNumber` delegates to it.
+- Profiler inference uses repaired, parsed values with a 90% gate, so currency text types numeric with parsed min/max/mean/IQR and a `numeric-stored-as-text` badge; mostly-text columns stay text with an `unparseable-numbers` count. Source rows are unchanged.
+- Mixed currencies: conversion is blocked when any present cell lacks a currency (kept as text and flagged by the `formatted-numbers-mixed-currency` group + profile issue); fully attributed mixed columns convert as before. The requested dataset-level detected currency column is **deferred**: Smart Clean has no column-insertion contract, and adding one would change row schema, history, exports, and both engines' parity. Per-cell currency is available from `parseFormattedMoney(...).currency` for that follow-up.
+- Verification: focused rules/profile/smartClean/parity tests pass; full suite 142/142 (15 files), lint and typecheck pass.
+
 ## Task 1 — exact derivation (DONE 2026-11-06)
 - Goal: fill a missing target only when the user-confirmed formula derives it exactly from two other columns (for example total = quantity × unit price); observed cells stay untouched, derived cells are labeled derived, never ML-estimated.
 - Deviation 1: `src/engine/riskyDecisions.ts` has no `exact-derivation` branch, so the dry run reports `cellsChanged: 0` and apply returns the input unchanged.

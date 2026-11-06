@@ -10,24 +10,48 @@ export function trimWhitespace(value: DataValue): DataValue {
   return typeof value === 'string' ? value.trim() : value
 }
 
-export function parseFormattedNumber(value: DataValue): DataValue {
-  if (typeof value !== 'string') return value
+export interface MoneyParse { numeric: DataValue; currency: string | null }
+
+const CURRENCY_SYMBOLS: Record<string, string> = { '₹': 'INR', $: 'USD', '£': 'GBP', '€': 'EUR', '¥': 'JPY' }
+const CURRENCY_CODE = '(?:INR|RS|USD|EUR|GBP|JPY)'
+
+/** Canonical currency family for a single cell, if one is clearly present. */
+export function detectCurrency(value: DataValue): string | null {
+  if (typeof value !== 'string') return null
   const text = value.trim()
-  if (!text || !/[\d]/.test(text)) return value
+  const symbol = text.match(/[₹$£€¥]/)?.[0]
+  if (symbol) return CURRENCY_SYMBOLS[symbol] ?? null
+  const code = text.match(new RegExp(`^\\(?\\s*(${CURRENCY_CODE})\\.?(?![A-Za-z])`, 'i'))?.[1]
+    ?? text.match(new RegExp(`(?:^|[^A-Za-z])(${CURRENCY_CODE})\\.?\\s*\\)?$`, 'i'))?.[1]
+  if (!code) return null
+  return code.toUpperCase() === 'RS' ? 'INR' : code.toUpperCase()
+}
+
+/** Parse a number and report the currency family it was written in. */
+export function parseFormattedMoney(value: DataValue): MoneyParse {
+  if (typeof value !== 'string') return { numeric: value, currency: null }
+  const text = value.trim()
+  const currency = detectCurrency(value)
+  if (!text || !/[\d]/.test(text)) return { numeric: value, currency }
   const percent = text.endsWith('%')
   const negative = /^\(.*\)$/.test(text)
-  let numericText = text.replace(/^(?:INR|USD|EUR|GBP)\s*/i, '').replace(/\s*(?:INR|USD|EUR|GBP)$/i, '')
-  numericText = numericText.replace(/[₹$£€¥%\s()]/g, '')
+  let numericText = text.replace(new RegExp(`^\\(?\\s*${CURRENCY_CODE}\\.?\\s*`, 'i'), '')
+  numericText = numericText.replace(new RegExp(`\\s*${CURRENCY_CODE}\\.?\\s*\\)?$`, 'i'), '')
+  numericText = numericText.replace(/[₹$£€¥%()\s]/g, '')
   // Accept European decimal commas and Indian digit grouping without interpreting
   // ordinary US thousands separators as decimals.
   if (/^\d{1,3}(?:\.\d{3})+,\d{1,2}$/.test(numericText)) numericText = numericText.replace(/\./g, '').replace(',', '.')
   else if (/^\d{1,2}(?:,\d{2})+,\d{3}(?:\.\d+)?$/.test(numericText)) numericText = numericText.replace(/,/g, '')
   else if (/^\d+,\d{1,2}$/.test(numericText)) numericText = numericText.replace(',', '.')
   else numericText = numericText.replace(/,/g, '')
-  const normalized = numericText
-  if (!/^-?(?:\d+\.?\d*|\.\d+)$/.test(normalized)) return value
-  const number = Number(normalized) * (negative ? -1 : 1)
-  return Number.isFinite(number) ? (percent ? number / 100 : number) : value
+  if (!/^-?(?:\d+\.?\d*|\.\d+)$/.test(numericText)) return { numeric: value, currency }
+  const number = Number(numericText) * (negative ? -1 : 1)
+  if (!Number.isFinite(number)) return { numeric: value, currency }
+  return { numeric: percent ? number / 100 : number, currency }
+}
+
+export function parseFormattedNumber(value: DataValue): DataValue {
+  return parseFormattedMoney(value).numeric
 }
 
 export function formattedNumberParseRate(values: readonly DataValue[]): number {
@@ -37,12 +61,7 @@ export function formattedNumberParseRate(values: readonly DataValue[]): number {
 }
 
 export function currencySignature(value: DataValue): string | null {
-  if (typeof value !== 'string') return null
-  const text = value.trim()
-  const code = text.match(/(?:^|\s)(INR|USD|EUR|GBP)(?:$|\s)/i)?.[1]
-  const symbol = text.match(/[₹$£€¥]/)?.[0]
-  const signature = code?.toUpperCase() ?? (symbol ? ({ '₹': 'INR', '$': 'USD', '£': 'GBP', '€': 'EUR', '¥': 'JPY' } as Record<string, string>)[symbol] : null)
-  return signature ?? null
+  return detectCurrency(value)
 }
 
 export function canonicalCategoryKey(value: string): string {
@@ -97,19 +116,29 @@ export function buildCategoryMappingFromCounts(values: Iterable<readonly [string
     for (const [variant] of variants) if (variant !== canonical) mapping.set(variant, canonical)
   }
   return mapping
+}// Windows-1252 maps bytes 0x80-0x9F to these characters instead of the matching
+// Latin-1 code points, so they must be mapped back before decoding as UTF-8.
+const CP1252_SPECIALS: Record<string, number> = {
+  '€': 0x80, '‚': 0x82, 'ƒ': 0x83, '„': 0x84, '…': 0x85, '†': 0x86, '‡': 0x87, 'ˆ': 0x88, '‰': 0x89,
+  'Š': 0x8a, '‹': 0x8b, 'Œ': 0x8c, 'Ž': 0x8e, '‘': 0x91, '’': 0x92, '“': 0x93, '”': 0x94, '•': 0x95,
+  '–': 0x96, '—': 0x97, '˜': 0x98, '™': 0x99, 'š': 0x9a, '›': 0x9b, 'œ': 0x9c, 'ž': 0x9e, 'Ÿ': 0x9f,
 }
+const suspiciousMojibake = (text: string): number => (text.match(/[ÃÂâð�]/g) ?? []).length
 
 export function repairMojibake(value: DataValue): DataValue {
-  if (typeof value !== 'string' || !/[ÃÂâð�]/.test(value)) return value
-  const knownRepairs: Array<[string, string]> = [['â€™', '’'], ['â€œ', '“'], ['â€�', '”'], ['â€“', '–'], ['â€”', '—'], ['â€¦', '…'], ['Â ', ' '], ['Â£', '£'], ['Â€', '€']]
-  let known = value
-  for (const [bad, good] of knownRepairs) known = known.replaceAll(bad, good)
-  if (known !== value) return known
+  if (typeof value !== 'string' || suspiciousMojibake(value) === 0) return value
+  const bytes: number[] = []
+  for (const character of value) {
+    const special = CP1252_SPECIALS[character]
+    if (special !== undefined) { bytes.push(special); continue }
+    const code = character.codePointAt(0) ?? 0
+    if (code > 0xff) return value
+    bytes.push(code)
+  }
   try {
-    const bytes = Uint8Array.from(Array.from(value, (character) => character.charCodeAt(0) & 0xff))
-    const repaired = new TextDecoder('utf-8', { fatal: true }).decode(bytes)
-    const suspicious = (text: string) => (text.match(/[ÃÂâð�]/g) ?? []).length
-    return suspicious(repaired) < suspicious(value) ? repaired : value
+    const repaired = new TextDecoder('utf-8', { fatal: true }).decode(Uint8Array.from(bytes))
+    if (repaired.includes('\ufffd')) return value
+    return suspiciousMojibake(repaired) < suspiciousMojibake(value) ? repaired : value
   } catch { return value }
 }
 
@@ -124,7 +153,9 @@ export function isRuleApplicable(kind: CleaningRuleKind, column: ColumnProfile):
     case 'trim-whitespace': return column.leadingWhitespaceCount + column.trailingWhitespaceCount > 0
     case 'normalize-missing': return column.nullCount > 0 || column.topValues.some(({ value }) => typeof value === 'string' && MISSING_TOKENS.has(value.trim().toLowerCase()))
     case 'formatted-numbers': return column.inferredType === 'integer' || column.inferredType === 'float' || column.issues.some((issue) => issue.code.includes('mixed')) || column.topValues.some(({ value }) => typeof value === 'string' && typeof parseFormattedNumber(value) === 'number')
-    case 'repair-mojibake': return column.topValues.some(({ value }) => typeof value === 'string' && repairMojibake(value) !== value)
+    // Mojibake can hide in any column whose raw text has been repaired for typing;
+    // the deterministic transform is a no-op for cells without mojibake.
+    case 'repair-mojibake': return true
     case 'canonicalize-categories': {
       const keys = new Set<string>()
       return column.topValues.some(({ value }) => {

@@ -378,7 +378,7 @@ describe('in-memory and DuckDB risky rule parity', () => {
   })
 
   it.each(['trim-whitespace', 'normalize-missing', 'formatted-numbers', 'fix-type-mismatches'] as const)('matches in-memory Phase 2 values for %s', (kind) => {
-    const values = kind === 'formatted-numbers' ? ['$1,200.50', '(€42)', '12.5%', '₹12,34,567.50', 'INR 1,250.75', '€1.234,56', '1,25 EUR', 'plain']
+    const values = kind === 'formatted-numbers' ? ['$1,200.50', '(€42)', '12.5%', '₹12,34,567.50', '₹50,000', '374814 INR', 'Rs 1,200', 'Rs. 12,34,567', 'INR 1,250.75', '€1.234,56', '1,25 EUR', 'plain']
       : kind === 'fix-type-mismatches' ? [' TRUE ', 'false', 'other', ' 7 ']
         : kind === 'normalize-missing' ? ['N/A', '-', 'normal', null]
           : ['  alpha  ', 'beta\t', '', null]
@@ -494,7 +494,7 @@ describe('in-memory and DuckDB risky rule parity', () => {
   })
 
   it('repairs the supported mojibake corpus identically in DuckDB and memory', () => {
-    const values = ['FranÃ§ais', 'ordinary text', 'â€™']
+    const values = ['FranÃ§ais', 'ordinary text', 'â€™', 'â‚¹50000', 'â‚¬42']
     connection.query('DROP TABLE IF EXISTS repair_input')
     connection.query(`CREATE TABLE repair_input AS SELECT * FROM (VALUES ${values.map((value, index) => `('${value.replaceAll("'", "''")}', ${index})`).join(',')}) AS v(value, __dc_order)`)
     const expr = buildMojibakeRepairExpression('value')

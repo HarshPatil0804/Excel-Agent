@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { buildCategoryMapping, formattedNumberParseRate, parseFormattedNumber, repairMojibake } from './rules'
+import { buildCategoryMapping, formattedNumberParseRate, parseFormattedMoney, parseFormattedNumber, repairMojibake } from './rules'
 
 describe('formatted number and text repair helpers', () => {
   it.each([
@@ -16,6 +16,31 @@ describe('formatted number and text repair helpers', () => {
     expect(repairMojibake('FranÃ§ais')).toBe('Français')
     expect(repairMojibake('ordinary text')).toBe('ordinary text')
     expect(repairMojibake('Ã')).toBe('Ã')
+  })
+
+  it('decodes Windows-1252 mojibake back to UTF-8, including rupee and euro', () => {
+    expect(repairMojibake('â‚¹50000')).toBe('₹50000')
+    expect(repairMojibake('â‚¬42')).toBe('€42')
+    expect(repairMojibake('â€™')).toBe('’')
+    expect(repairMojibake('MontrÃ©al')).toBe('Montréal')
+    expect(repairMojibake('café')).toBe('café')
+    expect(repairMojibake('₹1,200')).toBe('₹1,200')
+    expect(parseFormattedNumber(repairMojibake('â‚¹50000'))).toBe(50000)
+  })
+
+  it.each([
+    ['₹50,000', 50000, 'INR'],
+    ['374814 INR', 374814, 'INR'],
+    ['Rs 1,200', 1200, 'INR'],
+    ['Rs. 12,34,567', 1234567, 'INR'],
+    ['1,234,567', 1234567, null],
+    ['$134,036.00', 134036, 'USD'],
+    ['(1,200)', -1200, null],
+    ['€1.234,56', 1234.56, 'EUR'],
+    ['  12.5%  ', 0.125, null],
+    ['plain text', 'plain text', null],
+  ])('parses money value %s', (value, numeric, currency) => {
+    expect(parseFormattedMoney(value)).toEqual({ numeric, currency })
   })
 
   it('measures numeric conversion eligibility while excluding missing tokens', () => {

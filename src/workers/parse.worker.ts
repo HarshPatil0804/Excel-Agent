@@ -401,6 +401,31 @@ async function cleanLargeDataset(profile: ReturnType<typeof profileResultSchema.
   const protectedSet = new Set(protectedColumns)
   const mutable = profile.columns.filter((column) => !protectedSet.has(column.name))
   const completePlan = buildSmartCleanPlan(profile, protectedColumns, requestedRules ?? [...LOW_RISK_RULES, ...RISKY_RULES])
+  const rulePlan = completePlan.filter((item) => !item.proposed)
+  const plannedColumns = (id: string) => rulePlan.find((item) => item.rule.id === id)?.columns ?? []
+  const quote = sqlIdentifier
+  const groups: Array<{ ruleId: string; category: string; label: string; columnCount: number; columns: string[]; columnIds?: string[]; affectedRows: number; samples: string[]; rowsRemoved?: number; cellsChanged?: number; cellsFlagged?: number; columnsRenamed?: number; columnsRemoved?: number; warning?: string }> = []
+  const deferredFill = completePlan.find((item) => item.rule.kind === 'fill-missing')?.deferredColumns ?? []
+  if (deferredFill.length) groups.push({ ruleId: 'fill-missing-deferred', category: 'fill-missing', label: `${deferredFill.length} high-missing columns left null`, columnCount: deferredFill.length, columns: deferredFill, columnIds: deferredFill.map((name) => profile.columns.find((column) => column.name === name)?.id ?? `column:${name}`), affectedRows: 0, cellsChanged: 0, cellsFlagged: deferredFill.reduce((sum, name) => sum + (profile.columns.find((column) => column.name === name)?.nullCount ?? 0), 0), rowsRemoved: 0, columnsRenamed: 0, samples: [] })
+  const excludedFill = completePlan.find((item) => item.rule.kind === 'fill-missing')?.excludedColumns ?? []
+  const mixedCurrency = profile.columns.filter((column) => !protectedSet.has(column.name) && column.issues.some((issue) => issue.code === 'mixed-currency'))
+  if (mixedCurrency.length) groups.push({ ruleId: 'formatted-numbers-mixed-currency', category: 'formatted-numbers', label: `${mixedCurrency.length} columns contain mixed currencies; review before combining`, columnCount: mixedCurrency.length, columns: mixedCurrency.map((column) => column.name), columnIds: mixedCurrency.map((column) => column.id), affectedRows: 0, cellsChanged: 0, rowsRemoved: 0, columnsRenamed: 0, cellsFlagged: mixedCurrency.reduce((sum, column) => sum + Math.max(0, sourceRowCount - column.nullCount), 0), samples: mixedCurrency.slice(0, 10).map((column) => `${column.name}: ${column.currencySymbols.join(', ') || 'multiple currencies'}`) })
+  if (excludedFill.length) groups.push({ ruleId: 'fill-missing-excluded', category: 'fill-missing', label: `${excludedFill.length} identifier/text columns excluded from autofill`, columnCount: excludedFill.length, columns: excludedFill, columnIds: excludedFill.map((name) => profile.columns.find((column) => column.name === name)?.id ?? `column:${name}`), affectedRows: 0, cellsChanged: 0, cellsFlagged: 0, rowsRemoved: 0, columnsRenamed: 0, samples: ['Identifier and free-text columns require an explicit scope before imputation.'] })
+  const total = 9
+  const progress = (step: number, rule: string) => send({ type: 'clean-progress', completed: step, total, rule })
+  const update = async (id: string, expr: (column: string) => string, subset = mutable.map((c) => c.name)) => {
+    if (!subset.length) return
+    const expressions = subset.map((name) => ({ name, value: expr(name) }))
+    const cellsChanged = Number((await queryRows(connection, `SELECT COALESCE(SUM(${expressions.map(({ name, value }) => `CASE WHEN ${quote(name)} IS DISTINCT FROM ${value} THEN 1 ELSE 0 END`).join(' + ')}),0) AS count FROM ${targetTable}`))[0]?.count ?? 0)
+    const affectedPredicate = expressions.map(({ name, value }) => `${quote(name)} IS DISTINCT FROM ${value}`).join(' OR ')
+    const affectedRows = Number((await queryRows(connection, `SELECT COUNT(*) AS count FROM ${targetTable} WHERE ${affectedPredicate}`))[0]?.count ?? 0)
+    await connection.query(`UPDATE ${targetTable} SET ${expressions.map(({ name, value }) => `${quote(name)} = ${value}`).join(', ')}`)
+    groups.push({ ruleId: id, category: id, label: `${cellsChanged.toLocaleString()} cells changed across ${affectedRows.toLocaleString()} rows`, columnCount: subset.length, columns: subset, columnIds: subset.map((name) => largeStableIds.get(name) ?? `column:${name}`), affectedRows, cellsChanged, samples: [] })
+  }
+  await update('trim-whitespace', (name) => buildLowRiskExpression('trim-whitespace', name), plannedColumns('trim-whitespace')); progress(1, 'trim-whitespace')
+  await update('normalize-missing', (name) => buildLowRiskExpression('normalize-missing', name), plannedColumns('normalize-missing')); progress(2, 'normalize-missing')
+  await update('repair-mojibake', (name) => buildMojibakeRepairExpression(name), plannedColumns('repair-mojibake')); progress(3, 'repair-mojibake')
+  // Number eligibility is measured after mojibake repair because repair runs first.
   const formattedPlan = completePlan.find((item) => item.rule.kind === 'formatted-numbers')
   if (formattedPlan?.columns.length) {
     const candidates = formattedPlan.columns.map((name, index) => {
@@ -422,30 +447,7 @@ async function cleanLargeDataset(profile: ReturnType<typeof profileResultSchema.
     formattedPlan.columns = eligible
     formattedPlan.columnIds = eligible.map((name) => largeStableIds.get(name) ?? profile.columns.find((column) => column.name === name)?.id ?? `column:${name}`)
   }
-  const rulePlan = completePlan.filter((item) => !item.proposed)
-  const plannedColumns = (id: string) => rulePlan.find((item) => item.rule.id === id)?.columns ?? []
-  const quote = sqlIdentifier
-  const groups: Array<{ ruleId: string; category: string; label: string; columnCount: number; columns: string[]; columnIds?: string[]; affectedRows: number; samples: string[]; rowsRemoved?: number; cellsChanged?: number; cellsFlagged?: number; columnsRenamed?: number; columnsRemoved?: number; warning?: string }> = []
-  const deferredFill = completePlan.find((item) => item.rule.kind === 'fill-missing')?.deferredColumns ?? []
-  if (deferredFill.length) groups.push({ ruleId: 'fill-missing-deferred', category: 'fill-missing', label: `${deferredFill.length} high-missing columns left null`, columnCount: deferredFill.length, columns: deferredFill, columnIds: deferredFill.map((name) => profile.columns.find((column) => column.name === name)?.id ?? `column:${name}`), affectedRows: 0, cellsChanged: 0, cellsFlagged: deferredFill.reduce((sum, name) => sum + (profile.columns.find((column) => column.name === name)?.nullCount ?? 0), 0), rowsRemoved: 0, columnsRenamed: 0, samples: [] })
-  const excludedFill = completePlan.find((item) => item.rule.kind === 'fill-missing')?.excludedColumns ?? []
-  if (excludedFill.length) groups.push({ ruleId: 'fill-missing-excluded', category: 'fill-missing', label: `${excludedFill.length} identifier/text columns excluded from autofill`, columnCount: excludedFill.length, columns: excludedFill, columnIds: excludedFill.map((name) => profile.columns.find((column) => column.name === name)?.id ?? `column:${name}`), affectedRows: 0, cellsChanged: 0, cellsFlagged: 0, rowsRemoved: 0, columnsRenamed: 0, samples: ['Identifier and free-text columns require an explicit scope before imputation.'] })
-  const total = 9
-  const progress = (step: number, rule: string) => send({ type: 'clean-progress', completed: step, total, rule })
-  const update = async (id: string, expr: (column: string) => string, subset = mutable.map((c) => c.name)) => {
-    if (!subset.length) return
-    const expressions = subset.map((name) => ({ name, value: expr(name) }))
-    const cellsChanged = Number((await queryRows(connection, `SELECT COALESCE(SUM(${expressions.map(({ name, value }) => `CASE WHEN ${quote(name)} IS DISTINCT FROM ${value} THEN 1 ELSE 0 END`).join(' + ')}),0) AS count FROM ${targetTable}`))[0]?.count ?? 0)
-    const affectedPredicate = expressions.map(({ name, value }) => `${quote(name)} IS DISTINCT FROM ${value}`).join(' OR ')
-    const affectedRows = Number((await queryRows(connection, `SELECT COUNT(*) AS count FROM ${targetTable} WHERE ${affectedPredicate}`))[0]?.count ?? 0)
-    await connection.query(`UPDATE ${targetTable} SET ${expressions.map(({ name, value }) => `${quote(name)} = ${value}`).join(', ')}`)
-    groups.push({ ruleId: id, category: id, label: `${cellsChanged.toLocaleString()} cells changed across ${affectedRows.toLocaleString()} rows`, columnCount: subset.length, columns: subset, columnIds: subset.map((name) => largeStableIds.get(name) ?? `column:${name}`), affectedRows, cellsChanged, samples: [] })
-  }
-  await update('trim-whitespace', (name) => buildLowRiskExpression('trim-whitespace', name), plannedColumns('trim-whitespace')); progress(1, 'trim-whitespace')
-  await update('normalize-missing', (name) => buildLowRiskExpression('normalize-missing', name), plannedColumns('normalize-missing')); progress(2, 'normalize-missing')
-  const numeric = plannedColumns('formatted-numbers')
-  await update('formatted-numbers', (name) => buildLowRiskExpression('formatted-numbers', name), numeric); progress(3, 'formatted-numbers')
-  await update('repair-mojibake', (name) => buildMojibakeRepairExpression(name), plannedColumns('repair-mojibake'))
+  await update('formatted-numbers', (name) => buildLowRiskExpression('formatted-numbers', name), formattedPlan?.columns ?? []); progress(4, 'formatted-numbers')
   const categoryRule = completePlan.find((item) => item.rule.kind === 'canonicalize-categories')
   const categoryCandidates = profile.columns.filter((column) => !protectedSet.has(column.name) && !protectedSet.has(column.id) && column.inferredType === 'categorical' && (!categoryRule || scopeMatches(categoryRule.rule, column))).map((column) => column.name)
   if (categoryCandidates.length) {

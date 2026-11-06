@@ -1,6 +1,6 @@
 import { z } from 'zod'
 import type { ColumnIssue, ColumnProfile, DataRow, DataValue, InferredType, IssueSeverity, ProfileResult } from '../types'
-import { currencySignature, parseFormattedNumber } from '../cleaners/rules'
+import { currencySignature, parseFormattedNumber, repairMojibake } from '../cleaners/rules'
 
 const severitySchema = z.enum(['info', 'warning', 'error'])
 const issueSchema = z.object({ code: z.string(), severity: severitySchema, message: z.string(), count: z.number().int().nonnegative().optional() })
@@ -35,6 +35,14 @@ function kindOf(value: DataValue): string {
   return 'text'
 }
 
+/** Parse a possibly formatted or mojibake-repaired cell as a number. */
+function numericValue(value: DataValue): number | null {
+  if (typeof value === 'number') return Number.isFinite(value) ? value : null
+  if (typeof value !== 'string') return null
+  const parsed = parseFormattedNumber(repairMojibake(value))
+  return typeof parsed === 'number' && Number.isFinite(parsed) ? parsed : null
+}
+
 export function inferColumnType(values: DataValue[], columnName = ''): InferredType {
   const present = values.filter((value) => !isMissing(value))
   if (!present.length) return 'categorical'
@@ -44,6 +52,9 @@ export function inferColumnType(values: DataValue[], columnName = ''): InferredT
   if ([...kinds].every((kind) => kind === 'boolean')) return 'boolean'
   if ([...kinds].every((kind) => kind === 'date')) return 'date'
   if ([...kinds].every((kind) => kind === 'date' || kind === 'datetime') && kinds.has('datetime')) return 'datetime'
+  // Currency/separator text counts as numeric when at least 90% of present cells parse.
+  const parsedNumbers = present.map(numericValue).filter((value): value is number => value !== null)
+  if (parsedNumbers.length / present.length >= 0.9) return parsedNumbers.every((value) => Number.isInteger(value)) ? 'integer' : 'float'
   const distinct = new Set(present.map(String)).size
   if (distinct <= Math.max(12, Math.ceil(present.length * 0.2)) && !/email|phone|address|description/i.test(columnName)) return 'categorical'
   return 'text'
@@ -92,7 +103,7 @@ export function profileColumn(name: string, values: DataValue[], id = `column:${
     if (existing) existing.count += 1
     else counts.set(key, { value, count: 1 })
     if (typeof value === 'string') {
-      const currency = currencySignature(value)
+      const currency = currencySignature(repairMojibake(value))
       if (currency) currencies.add(currency)
       if (/^\s/.test(value)) leadingWhitespaceCount += 1
       if (/\s$/.test(value)) trailingWhitespaceCount += 1
@@ -107,10 +118,16 @@ export function profileColumn(name: string, values: DataValue[], id = `column:${
   }
 
   const type = inferColumnType(values, name)
-  const numericValues = present.map((value) => Number(value)).filter(Number.isFinite)
+  const numericValues = present.map(numericValue).filter((value): value is number => value !== null)
   const quartiles = numericQuartiles(numericValues)
   const iqrOutlierCount = quartiles ? numericValues.filter((value) => value < quartiles.low || value > quartiles.high).length : 0
-  const domainNumbers = present.map((value) => parseFormattedNumber(value)).filter((value): value is number => typeof value === 'number')
+  const formattedTextCount = present.filter((value) => {
+    if (typeof value !== 'string') return false
+    const text = String(repairMojibake(value)).trim()
+    return numericValue(value) !== null && !/^-?\d+(?:\.\d+)?$/.test(text)
+  }).length
+  const parseFailures = present.length - numericValues.length
+  const domainNumbers = numericValues
   const negativeQuantityCount = candidateQuantityColumn ? domainNumbers.filter((value) => value < 0).length : 0
   const negativeProfitCount = candidateProfitColumn ? domainNumbers.filter((value) => value < 0).length : 0
   const today = new Date(); today.setHours(23, 59, 59, 999)
@@ -144,6 +161,8 @@ export function profileColumn(name: string, values: DataValue[], id = `column:${
   addIssue(issues, 'negative-profit', 'warning', 'Negative profit values require review.', negativeProfitCount)
   addIssue(issues, 'future-date', 'warning', 'Dates later than today require review.', futureDateCount)
   addIssue(issues, 'identifier-column', 'info', 'This high-uniqueness ID/code column is excluded from automatic imputation.', identifierColumn ? present.length : 0)
+  addIssue(issues, 'numeric-stored-as-text', 'warning', 'Numbers are stored as text with currency symbols or separators.', formattedTextCount)
+  addIssue(issues, 'unparseable-numbers', 'warning', 'Some values could not be parsed as numbers and will be left unchanged.', parseFailures > 0 && numericValues.length > 0 && numericValues.length / present.length < 0.9 ? parseFailures : 0)
 
   return {
     id, name, inferredType: type, nullCount, nullPercent: values.length ? (nullCount / values.length) * 100 : 0,
